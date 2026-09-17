@@ -1,16 +1,21 @@
 /**
  * Cloudflare Worker - GCM Proxy 服务端
  *
- * 对应客户端: gcm.cjs
- * 功能: 通过 WebSocket 接收 SOCKS5 代理请求，转发到目标服务器
+ * 对应客户端: gcm-cli（Go CLI，`gcm --worker <URL>`）与 x-client Android
+ *   （AAR 内 gcm 库，Profile 的 WorkerHost 字段）
+ * 功能: 通过 WebSocket 接收 GCM 二进制多路复用代理请求，转发到目标服务器
  *
- * 协议格式 (2字节头, 仅多路复用):
- * - 客户端 -> Worker: [STREAM_ID:1][TYPE:1=0]{host:port}|
- * - 客户端 -> Worker: [STREAM_ID:1][TYPE:1=2][binary_data]
- * - 客户端 -> Worker: [STREAM_ID:1][TYPE:1=3]
- * - Worker -> 客户端: [STREAM_ID:1][TYPE:1=1]
- * - Worker -> 客户端: [STREAM_ID:1][TYPE:1=2][binary_data]
- * - Worker -> 客户端: [STREAM_ID:1][TYPE:1=3]
+ * 接入路径: wss://<worker域名>/<USER_ID>?fallbackip=<出口IP列表>
+ *   - USER_ID 取 env.USER_ID（小写匹配），不匹配的路径一律拒绝
+ *   - ?fallbackip= 可重复/逗号分隔，每项支持 host 或 host:port，作为客户端侧出口偏好
+ *
+ * 协议格式 (2字节头: [STREAM_ID:1][TYPE:1]，TYPE 语义见 gcm 库 protocol 包):
+ * - 客户端 -> Worker: TYPE=0 CONNECT，DATA 为 ASCII "host:port|"
+ * - 客户端 -> Worker: TYPE=2 DATA，[binary_data]
+ * - 客户端 -> Worker: TYPE=3 CLOSE
+ * - Worker -> 客户端: TYPE=1 CONNECTED（无 DATA）
+ * - Worker -> 客户端: TYPE=2 DATA，[binary_data]
+ * - Worker -> 客户端: TYPE=3 CLOSE
  *
  * 出口顺序: 直连原始 host > 客户端 ?fallbackip= > 动态节点 API（env.DYNAMIC_NODES_URL）> 静态 fallback（env.FALLBACK_IPS，
  *   每项支持 host 或 host:port；无硬编码默认值）
@@ -21,7 +26,8 @@
  * 3. 创建新 Worker
  * 4. 将此代码粘贴到编辑器
  * 5. 部署并记录 Worker URL
- * 6. 在 gcm/config.json 中设置 workerHost
+ * 6. 在 gcm-cli 的 --worker 参数（或 x-client Profile 的 WorkerHost）设置该 URL；
+ *    环境变量（USER_ID/FALLBACK_IPS 等）见同目录 DEPLOY.md
  */
 
 import { connect } from "cloudflare:sockets";
