@@ -35,6 +35,8 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 | `ENABLE_DYNAMIC_NODES` / `DYNAMIC_NODES_TIMEOUT` | 动态节点开关与超时（毫秒） |
 | `CONNECT_TIMEOUT` | 出口连接超时（毫秒） |
 | `MAX_STREAMS_PER_CONNECTION` | 单 WebSocket 连接最大流数 |
+| `MAX_PENDING_BYTES` | 预连接窗口内每条流缓存的早期数据上限（字节，默认 `1048576`，范围 16KiB–8MiB），超限回 CLOSE |
+| `MAX_FALLBACK_IPS` | `?fallbackip=` 条数上限（默认 `16`，范围 1–64），超出部分忽略 |
 | `ENABLE_LOGGING` | 调试日志开关 |
 
 ## 客户端接入

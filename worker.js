@@ -45,6 +45,8 @@ const DEFAULT_CONFIG = {
   connectTimeout: 1000,
   enableLogging: false,
   maxStreamsPerConnection: 16,
+  maxPendingBytes: 1048576, // 预连接窗口内每条流最多缓存 1MiB 早期数据，超限即快速失败
+  maxFallbackIPs: 16, // ?fallbackip= 条数上限，防止单条 CONNECT 拉出超长拨号链
   enableDynamicNodes: true,
   dynamicNodesUrl: "",
   dynamicNodesTimeout: 3000, // 拉取动态列表超时 3s，失败直接降级
@@ -71,6 +73,8 @@ function buildConfigFromEnv(env) {
     connectTimeout: parseEnvInt(env.CONNECT_TIMEOUT, DEFAULT_CONFIG.connectTimeout, { min: 100, max: 30000 }),
     enableLogging: parseEnvBool(env.ENABLE_LOGGING, DEFAULT_CONFIG.enableLogging),
     maxStreamsPerConnection: parseEnvInt(env.MAX_STREAMS_PER_CONNECTION, DEFAULT_CONFIG.maxStreamsPerConnection, { min: 1, max: 256 }),
+    maxPendingBytes: parseEnvInt(env.MAX_PENDING_BYTES, DEFAULT_CONFIG.maxPendingBytes, { min: 16384, max: 8388608 }),
+    maxFallbackIPs: parseEnvInt(env.MAX_FALLBACK_IPS, DEFAULT_CONFIG.maxFallbackIPs, { min: 1, max: 64 }),
     enableDynamicNodes: parseEnvBool(env.ENABLE_DYNAMIC_NODES, DEFAULT_CONFIG.enableDynamicNodes),
     dynamicNodesUrl: (env.DYNAMIC_NODES_URL || "").trim(),
     dynamicNodesTimeout: parseEnvInt(env.DYNAMIC_NODES_TIMEOUT, DEFAULT_CONFIG.dynamicNodesTimeout, { min: 500, max: 30000 }),
@@ -256,11 +260,13 @@ async function getDynamicFallbacks(config) {
   return p;
 }
 
-// 建立 TCP 连接并等待就绪（上限 timeoutMs）
+// 建立 TCP 连接并等待就绪（上限 timeoutMs）；onSocket 在 connect() 后立即回调，
+// 让调用方登记在途 socket——流被客户端放弃时可以立刻取消，不必等满 CONNECT_TIMEOUT
 // 竞速失败（超时/连接被拒）一律 close：socket 在 connect() 时就已存在，
 // 迟到的成功连接否则会一直挂到 isolate 结束
-async function dialWithTimeout(host, port, timeoutMs) {
+async function dialWithTimeout(host, port, timeoutMs, onSocket) {
   const socket = connect({ hostname: host, port });
+  onSocket?.(socket);
   let won = false;
   let timer = null;
   try {
@@ -341,11 +347,13 @@ class StreamManager {
     const stream = {
       id: streamId,
       remoteSocket: null,
+      dialing: null, // 在途（尚未就绪）的 socket
       remoteWriter: null,
       remoteReader: null,
       isClosed: false,
       tcpConnected: false,
       pendingBuffer: [],
+      pendingBytes: 0,
     };
     this.streams.set(streamId, stream);
     this.streamCount++;
@@ -457,7 +465,11 @@ class StreamManager {
         attemptHost,
         attemptPort,
         this.config.connectTimeout,
+        (sock) => {
+          stream.dialing = sock; // 登记在途 socket，供 closeStreamObject 立即取消
+        },
       );
+      stream.dialing = null;
 
       const remoteWriter = remoteSocket.writable.getWriter();
       const remoteReader = remoteSocket.readable.getReader();
@@ -527,9 +539,18 @@ class StreamManager {
     }
 
 
-    // TCP 尚未连上时缓存数据，等连接成功后 flush
+    // TCP 尚未连上时缓存数据，等连接成功后 flush；
+    // 预连接窗口最长可达 N×CONNECT_TIMEOUT，客户端可借此无限灌数据撑爆 isolate 内存，
+    // 故累计字节超限即快速失败（回 CLOSE 让客户端立即感知）
     if (!stream.tcpConnected) {
       const bufData = data instanceof Uint8Array ? data : encoder.encode(data);
+      stream.pendingBytes += bufData.length;
+      if (stream.pendingBytes > this.config.maxPendingBytes) {
+        this.log(`[${streamId}] 早期数据超过上限 ${this.config.maxPendingBytes}B，关流`);
+        this.sendClose(streamId);
+        this.closeStreamObject(stream);
+        return false;
+      }
       stream.pendingBuffer.push(bufData);
       return true;
     }
@@ -566,6 +587,7 @@ class StreamManager {
 
     // 清理缓存
     stream.pendingBuffer = [];
+    stream.pendingBytes = 0;
 
     try {
       stream.remoteWriter?.releaseLock();
@@ -575,6 +597,9 @@ class StreamManager {
     } catch {}
     try {
       stream.remoteSocket?.close();
+    } catch {}
+    try {
+      stream.dialing?.close(); // 取消在途拨号，不让它占着连接额度直到超时
     } catch {}
 
     if (this.streams.get(stream.id) === stream) {
@@ -719,6 +744,14 @@ export default {
         const queryFallbackIPs = dedupList(
           url.searchParams.getAll("fallbackip").flatMap(splitList),
         );
+        if (queryFallbackIPs.length > baseConfig.maxFallbackIPs) {
+          log(
+            "WS",
+            `?fallbackip= 条目 ${queryFallbackIPs.length} 超过上限 ${baseConfig.maxFallbackIPs}，已截断`,
+            baseConfig.enableLogging,
+          );
+          queryFallbackIPs.length = baseConfig.maxFallbackIPs;
+        }
         const envFallbackIPs = splitList(env.FALLBACK_IPS);
         // 静态 fallback 只从环境变量读取，不再合并硬编码默认值
         const staticFallbackIPs = dedupList([...envFallbackIPs]);

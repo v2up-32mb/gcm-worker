@@ -82,21 +82,32 @@ describe("纯函数", () => {
     assert.equal(dflt.connectTimeout, 1000);
     assert.equal(dflt.maxStreamsPerConnection, 16);
     assert.equal(dflt.dynamicNodesUrl, "");
+    assert.equal(dflt.maxPendingBytes, 1048576, "早期数据缓存默认 1MiB");
+    assert.equal(dflt.maxFallbackIPs, 16);
 
     const custom = c({
       ENABLE_FALLBACK: "off",
       CONNECT_TIMEOUT: "50", // 低于 min=100 → 回退默认
       MAX_STREAMS_PER_CONNECTION: "999", // 高于 max=256 → 回退默认
+      MAX_PENDING_BYTES: "100", // 低于 min=16384 → 回退默认
+      MAX_PENDING_BYTES_LOW: null,
+      MAX_FALLBACK_IPS: "1000", // 高于 max=64 → 回退默认
       DYNAMIC_NODES_URL: " https://nodes.example/api ",
     });
     assert.equal(custom.enableFallback, false);
     assert.equal(custom.connectTimeout, 1000);
     assert.equal(custom.maxStreamsPerConnection, 16);
+    assert.equal(custom.maxPendingBytes, 1048576);
+    assert.equal(custom.maxFallbackIPs, 16);
     assert.equal(custom.dynamicNodesUrl, "https://nodes.example/api");
+
+    assert.equal(c({ MAX_PENDING_BYTES: "65536" }).maxPendingBytes, 65536);
+    assert.equal(c({ MAX_FALLBACK_IPS: "4" }).maxFallbackIPs, 4);
 
     assert.equal(c({ ENABLE_LOGGING: "1" }).enableLogging, true);
     assert.equal(c({ ENABLE_LOGGING: "yes" }).enableLogging, true);
     assert.equal(c({ ENABLE_LOGGING: "nope" }).enableLogging, false, "无法识别的值回退默认");
+    assert.equal(c({ ENABLE_DYNAMIC_NODES: "off" }).enableDynamicNodes, false);
   });
 
   test("环境变量列表解析：逗号分隔、去空白、去重（经 ?fallbackip= 与 FALLBACK_IPS 间接覆盖）", () => {
@@ -169,6 +180,30 @@ for (const [label, worker] of VARIANTS) {
       assert.deepEqual(sock.toTarget.map((b) => Buffer.from(b).toString()), ["early-1", "early-2"]);
       // CONNECTED 必须是该流的第一帧（缓存期不得回发 DATA）
       assert.equal(server.typesOf(7)[0], T.CONNECTED);
+    });
+
+    test("早期数据缓存超上限：回 CLOSE 并关流（回归：可撑爆 isolate 内存）", async () => {
+      setPolicy(() => "hang");
+      const { server } = await openSession(worker, {
+        envVars: { CONNECT_TIMEOUT: "30000", MAX_PENDING_BYTES: "16384" },
+      });
+      await server.fromClient(connectFrame(4, "slow.example", 443));
+      await server.fromClient(frame(4, T.DATA, new Uint8Array(10 * 1024)));
+      await server.fromClient(frame(4, T.DATA, new Uint8Array(10 * 1024))); // 累计 20KiB > 16KiB
+      await waitFor(() => server.typesOf(4).includes(T.CLOSE), { label: "超限 CLOSE" });
+      assert.equal(sockets()[0].closed, true, "socket 应被回收");
+    });
+
+    test("?fallbackip= 条数超上限被截断（回归：单条 CONNECT 拉出超长拨号链）", async () => {
+      setPolicy(() => "reject");
+      const many = Array.from({ length: 12 }, (_, i) => `fb${i}.example`).join(",");
+      const { server } = await openSession(worker, {
+        query: `?fallbackip=${many}`,
+        envVars: { MAX_FALLBACK_IPS: "3" },
+      });
+      await server.fromClient(connectFrame(3, "direct.example", 443));
+      await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "全败 CLOSE" });
+      assert.equal(sockets().length, 4, "直连 + 3 条被截断后的 query 回退（不再拨第 4 条起）");
     });
 
     test("连接超时会回收 socket 并转试下一个出口", async () => {
