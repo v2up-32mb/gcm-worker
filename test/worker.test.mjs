@@ -516,7 +516,8 @@ for (const [label, worker] of VARIANTS) {
       });
       try {
         setPolicy(() => "reject");
-        const { server } = await openSession(worker, {
+        const w = await freshWorker(worker === workers.min ? "min" : "dev");
+        const { server } = await openSession(w, {
           envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" },
         });
         await server.fromClient(connectFrame(6, "direct.example", 443));
@@ -531,19 +532,52 @@ for (const [label, worker] of VARIANTS) {
       }
     });
 
-    test("动态节点拉取失败时降级为空并继续静态回退", async () => {
+    // 以下两条用 freshWorker：worker.js 有模块级 dynamicNodesCache（stale 降级），
+    // 共用实例会让用例互相污染（评审 F20：曾出现"名为降级为空、实际走 stale"的假绿）
+    test("动态节点拉取失败（无 stale）降级为空并继续静态回退", async () => {
       const realFetch = globalThis.fetch;
       globalThis.fetch = async () => {
         throw new Error("network down");
       };
       try {
         setPolicy((opts) => (opts.hostname === "static.example" ? "open" : "reject"));
-        const { server } = await openSession(worker, {
+        const w = await freshWorker(worker === workers.min ? "min" : "dev");
+        const { server } = await openSession(w, {
           envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api", FALLBACK_IPS: "static.example" },
         });
         await server.fromClient(connectFrame(8, "direct.example", 443));
         await waitFor(() => server.typesOf(8).includes(T.CONNECTED), { label: "静态回退成功" });
-        assert.equal(sockets().at(-1).opts.hostname, "static.example");
+        const tried = sockets().map((s) => s.opts.hostname);
+        assert.deepEqual(tried, ["direct.example", "static.example"], "拉取失败且无 stale 时不得有任何动态节点被拨");
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+
+    test("动态节点拉取失败时复用上次的 stale 列表（有意行为）", async () => {
+      const realFetch = globalThis.fetch;
+      let mode = "ok";
+      globalThis.fetch = async () => {
+        if (mode === "fail") throw new Error("network down");
+        return { ok: true, status: 200, json: async () => ({ nodes: [{ ip: "stale.example" }] }) };
+      };
+      try {
+        // 第一次：API 正常，拿到 stale.example
+        setPolicy((opts) => (opts.hostname === "stale.example" ? "open" : "reject"));
+        const w = await freshWorker(worker === workers.min ? "min" : "dev");
+        let s = await openSession(w, { envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" } });
+        await s.server.fromClient(connectFrame(1, "direct.example", 443));
+        await waitFor(() => s.server.typesOf(1).includes(T.CONNECTED), { label: "动态节点接通" });
+        s.server.close();
+        resetStub();
+
+        // 第二次：API 故障，同一模块实例应复用 stale 列表
+        mode = "fail";
+        setPolicy((opts) => (opts.hostname === "stale.example" ? "open" : "reject"));
+        s = await openSession(w, { envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" } });
+        await s.server.fromClient(connectFrame(2, "direct.example", 443));
+        await waitFor(() => s.server.typesOf(2).includes(T.CONNECTED), { label: "stale 回退接通" });
+        assert.equal(sockets()[1].opts.hostname, "stale.example", "API 故障时应复用 stale 列表");
       } finally {
         globalThis.fetch = realFetch;
       }
