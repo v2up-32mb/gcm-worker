@@ -210,6 +210,25 @@ for (const [label, worker] of VARIANTS) {
       assert.deepEqual(sockets()[0].opts, { hostname: "example.com", port: 443 });
     });
 
+    test("全部出口失败时向客户端回 CLOSE（快速失败，不等客户端超时）", async () => {
+      globalThis.__CF_STUB__ = { sockets: [], reset() {}, policy: () => "reject" };
+      const { server } = await openSession(worker, { envVars: { FALLBACK_IPS: "b1.example,b2.example" } });
+      await server.fromClient(connectFrame(5, "nope.example", 443));
+      await waitFor(() => server.typesOf(5).includes(T.CLOSE), { label: "失败后 CLOSE" });
+      assert.equal(sockets().length, 3, "直连 + 2 个静态回退各试一次");
+      assert.ok(sockets().every((s) => s.closed), "被拒的 socket 也要回收");
+      // 失败后同一会话的其他流仍可用
+      globalThis.__CF_STUB__.policy = () => "open";
+      await server.fromClient(connectFrame(6, "ok.example", 443));
+      await waitFor(() => server.typesOf(6).includes(T.CONNECTED), { label: "后续流可用" });
+    });
+
+    test("目标地址非法时向客户端回 CLOSE", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(frame(1, T.CONNECT, "example.com:notaport|"));
+      await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: "非法目标 CLOSE" });
+    });
+
     test("重复 CONNECT 同一 streamId 会关旧流重建", async () => {
       const { server } = await openSession(worker);
       await server.fromClient(connectFrame(9, "a.example", 443));

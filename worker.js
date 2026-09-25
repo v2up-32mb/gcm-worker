@@ -328,7 +328,8 @@ class StreamManager {
 
     // 检查最大并发流数
     if (this.streamCount >= this.config.maxStreamsPerConnection) {
-      this.sendError(streamId, "Maximum streams exceeded");
+      // 无独立错误帧：CLOSE 即表示该流已终止
+      this.sendClose(streamId);
       return false;
     }
 
@@ -347,8 +348,9 @@ class StreamManager {
 
     const target = parseAddress(targetAddr);
     if (!target) {
-      // 目标地址非法：没有可试的出口，直接关流（不再无谓遍历回退列表）
+      // 目标地址非法：没有可试的出口，回 CLOSE 让客户端立即失败（不再无谓遍历回退列表）
       this.log(`[${streamId}] 目标地址不可解析: ${targetAddr}`);
+      this.sendClose(streamId);
       this.closeStream(streamId);
       return false;
     }
@@ -428,7 +430,8 @@ class StreamManager {
       }
     }
 
-    // 所有尝试都失败，清理预注册的 stream
+    // 所有尝试都失败：回 CLOSE 让客户端立即失败（否则客户端只能等自己的超时），再清理预注册的流
+    this.sendClose(streamId);
     this.closeStream(streamId);
     return false;
   }
@@ -568,16 +571,6 @@ class StreamManager {
         MSG_TYPE.CONNECTED, // Type (1 byte)
       ]);
       this.webSocket.send(header);
-    } catch {}
-  }
-
-  /**
-   * 发送错误响应
-   */
-  sendError(streamId, errorMsg) {
-    try {
-      // 错误响应需要额外信息，暂时用 CLOSE 代替
-      this.sendClose(streamId);
     } catch {}
   }
 
