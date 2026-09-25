@@ -351,6 +351,7 @@ class StreamManager {
       remoteWriter: null,
       remoteReader: null,
       isClosed: false,
+      closeNotified: false, // 是否已回过 CLOSE（每条流至多一帧）
       tcpConnected: false,
       pendingBuffer: [],
       pendingBytes: 0,
@@ -362,7 +363,7 @@ class StreamManager {
     if (!target) {
       // 目标地址非法：没有可试的出口，回 CLOSE 让客户端立即失败（不再无谓遍历回退列表）
       this.log(`[${streamId}] 目标地址不可解析: ${targetAddr}`);
-      this.sendClose(streamId);
+      this.sendCloseFor(stream);
       this.closeStreamObject(stream);
       return false;
     }
@@ -376,8 +377,8 @@ class StreamManager {
     }
 
     if (this.config.enableFallback) {
-      // 去重集合：前面已试过的，后面不再重复试
-      const seenHosts = new Set();
+      // 去重集合：前面已试过的，后面不再重复试（直连已试过，播种进去）
+      const seenHosts = new Set([`${host.toLowerCase()}:${port}`]);
       const markOrSeen = (parsed) => {
         const key = `${parsed.host.toLowerCase()}:${parsed.port}`;
         if (seenHosts.has(key)) return true;
@@ -444,7 +445,7 @@ class StreamManager {
     }
 
     // 所有尝试都失败：回 CLOSE 让客户端立即失败（否则客户端只能等自己的超时），再清理预注册的流
-    this.sendClose(streamId);
+    this.sendCloseFor(stream);
     this.closeStreamObject(stream);
     return false;
   }
@@ -497,7 +498,7 @@ class StreamManager {
           } catch (e) {
             this.log(`[${streamId}] flush 写入失败: ${e.message}`);
             // 尚未 sendConnected，也没有 pump 兜底发 CLOSE，必须自己回一帧让客户端快速失败
-            this.sendClose(streamId);
+            this.sendCloseFor(stream);
             this.closeStreamObject(stream);
             return "aborted";
           }
@@ -547,7 +548,7 @@ class StreamManager {
       stream.pendingBytes += bufData.length;
       if (stream.pendingBytes > this.config.maxPendingBytes) {
         this.log(`[${streamId}] 早期数据超过上限 ${this.config.maxPendingBytes}B，关流`);
-        this.sendClose(streamId);
+        this.sendCloseFor(stream);
         this.closeStreamObject(stream);
         return false;
       }
@@ -564,7 +565,8 @@ class StreamManager {
       return true;
     } catch (e) {
       this.log(`[${streamId}] 写入失败: ${e.message}`);
-      this.closeStream(streamId);
+      this.sendCloseFor(stream);
+      this.closeStreamObject(stream);
       return false;
     }
   }
@@ -639,6 +641,20 @@ class StreamManager {
   }
 
   /**
+   * 通知客户端该流已终止：每条流至多回一帧 CLOSE。
+   * 若同 streamId 已被新一代流接管则不发（否则会误杀客户端刚建好的新流）；
+   * 若本流已被 closeStreamObject 摘除但客户端还没收到过终止帧（如写失败路径），
+   * 仍补发——否则客户端只能等自己的超时。
+   */
+  sendCloseFor(stream) {
+    if (stream.closeNotified) return;
+    const current = this.streams.get(stream.id);
+    if (current && current !== stream) return;
+    stream.closeNotified = true;
+    this.sendClose(stream.id);
+  }
+
+  /**
    * 发送流关闭通知
    */
   sendClose(streamId) {
@@ -672,10 +688,8 @@ class StreamManager {
       this.log(`[${streamId}] 转发异常: ${e.message}`);
     }
 
-    // 转发结束，关闭流（仅当自己仍是对应 id 的现任流）
-    if (this.streams.get(streamId) === stream) {
-      this.sendClose(streamId);
-    }
+    // 转发结束，关闭流（sendCloseFor 内部会判断同 id 是否已被新一代接管）
+    this.sendCloseFor(stream);
     this.closeStreamObject(stream);
   }
 

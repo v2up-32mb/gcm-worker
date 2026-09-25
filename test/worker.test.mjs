@@ -361,6 +361,130 @@ for (const [label, worker] of VARIANTS) {
       assert.equal(server.closed, null);
     });
 
+    test("回退项与直连 host 相同不重复拨号（跨列表去重）", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=direct.example",
+        envVars: { FALLBACK_IPS: "DIRECT.EXAMPLE:443" },
+      });
+      await server.fromClient(connectFrame(8, "direct.example", 443));
+      await waitFor(() => server.typesOf(8).includes(T.CLOSE), { label: "全败 CLOSE" });
+      assert.equal(sockets().length, 1, `与直连相同的回退项被重复拨了（回归）：${JSON.stringify(sockets().map((s) => s.opts.hostname))}`);
+    });
+
+    test("ENABLE_FALLBACK=false 时不走任何回退出口", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, {
+        envVars: { ENABLE_FALLBACK: "false", FALLBACK_IPS: "b1.example", DYNAMIC_NODES_URL: "https://nodes.example/api" },
+      });
+      await server.fromClient(connectFrame(2, "direct.example", 443));
+      await waitFor(() => server.typesOf(2).includes(T.CLOSE), { label: "直连失败即 CLOSE" });
+      assert.equal(sockets().length, 1, `ENABLE_FALLBACK=false 仍拨了回退：${JSON.stringify(sockets().map((s) => s.opts.hostname))}`);
+    });
+
+    test("ENABLE_DYNAMIC_NODES=false 时不外呼动态节点 API", async () => {
+      let fetched = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        fetched++;
+        return { ok: true, status: 200, json: async () => ({ nodes: [{ ip: "1.2.3.4" }] }) };
+      };
+      try {
+        setPolicy(() => "reject");
+        const { server } = await openSession(worker, {
+          envVars: { ENABLE_DYNAMIC_NODES: "false", DYNAMIC_NODES_URL: "https://nodes.example/api" },
+        });
+        await server.fromClient(connectFrame(2, "direct.example", 443));
+        await waitFor(() => server.typesOf(2).includes(T.CLOSE), { label: "直连失败即 CLOSE" });
+        assert.equal(fetched, 0, "ENABLE_DYNAMIC_NODES=false 仍外呼了 API");
+        assert.equal(sockets().length, 1);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+
+    test("流槽位在关闭后释放：顺序建流超过 MAX_STREAMS 仍能继续", async () => {
+      const { server } = await openSession(worker, { envVars: { MAX_STREAMS_PER_CONNECTION: "2" } });
+      for (const id of [1, 2]) {
+        await server.fromClient(connectFrame(id, `h${id}.example`, 443));
+        await waitFor(() => server.typesOf(id).includes(T.CONNECTED), { label: `流 ${id} CONNECTED` });
+      }
+      // 两条流依次被远端 EOF 结束（最常见的流终止路径）
+      for (const id of [1, 2]) {
+        sockets()[id - 1].eofToClient();
+        await waitFor(() => server.typesOf(id).includes(T.CLOSE), { label: `流 ${id} CLOSE` });
+      }
+      await new Promise((r) => setTimeout(r, 10));
+      await server.fromClient(connectFrame(3, "h3.example", 443));
+      await waitFor(() => server.typesOf(3).includes(T.CONNECTED), { label: "第三条流仍可建（槽位已回收）" });
+    });
+
+    test("写失败回 CLOSE 并回收流与 socket", async () => {
+      setWriteHook(() => {
+        throw new Error("write failed (RST)");
+      });
+      try {
+        const { server } = await openSession(worker);
+        await server.fromClient(connectFrame(6, "a.example", 443));
+        await waitFor(() => server.typesOf(6).includes(T.CONNECTED), { label: "CONNECTED" });
+        await server.fromClient(frame(6, T.DATA, "payload"));
+        await waitFor(() => server.typesOf(6).includes(T.CLOSE), { label: "写失败后 CLOSE" });
+        assert.equal(sockets()[0].closed, true, "socket 应被回收");
+        // 槽位已释放，同一会话可继续建流
+        setWriteHook(null);
+        await server.fromClient(connectFrame(7, "b.example", 443));
+        await waitFor(() => server.typesOf(7).includes(T.CONNECTED), { label: "后续流可用" });
+      } finally {
+        setWriteHook(null);
+      }
+    });
+
+    test("读异常：转发中断后回 CLOSE 并回收流", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(6, "a.example", 443));
+      await waitFor(() => server.typesOf(6).includes(T.CONNECTED), { label: "CONNECTED" });
+      sockets()[0].failToClient(new Error("read reset"));
+      await waitFor(() => server.typesOf(6).includes(T.CLOSE), { label: "读异常后 CLOSE" });
+      assert.equal(sockets()[0].closed, true, "socket 应被回收");
+    });
+
+    test("CONNECTED / CLOSE 帧严格 2 字节（协议铁律）", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(1, "a.example", 443));
+      await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: "CONNECTED" });
+      const sock = sockets()[0];
+      sock.eofToClient();
+      await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: "CLOSE" });
+      for (const f of server.sent) {
+        if (f[1] === T.CONNECTED || f[1] === T.CLOSE) {
+          assert.equal(f.length, 2, `${f[1] === T.CONNECTED ? "CONNECTED" : "CLOSE"} 帧多出 ${f.length - 2} 字节负载`);
+        }
+      }
+      assert.equal(sockets()[0].closed, true, "EOF 后流必须被清理（槽位回收）");
+    });
+
+    test("flush 写失败：回 CLOSE（回归：客户端无任何回帧只能等超时）", async () => {
+      let failNext = true;
+      setWriteHook(() => {
+        if (failNext) {
+          failNext = false;
+          throw new Error("flush write failed");
+        }
+      });
+      try {
+        setPolicy(() => "hang");
+        const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "30000" } });
+        await server.fromClient(connectFrame(3, "slow.example", 443));
+        await server.fromClient(frame(3, T.DATA, "early"));
+        const sock = sockets()[0];
+        sock.resolveOpened();
+        await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "flush 失败后 CLOSE" });
+        assert.equal(sock.closed, true, "socket 应被回收");
+      } finally {
+        setWriteHook(null);
+      }
+    });
+
     test("?fallbackip= 逐个尝试并去重", async () => {
       setPolicy((opts) => (opts.hostname === "dup.example" ? "open" : "reject"));
       const { server } = await openSession(worker, {
