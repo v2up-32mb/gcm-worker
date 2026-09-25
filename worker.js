@@ -256,6 +256,36 @@ async function getDynamicFallbacks(config) {
   return p;
 }
 
+// 建立 TCP 连接并等待就绪（上限 timeoutMs）
+// 竞速失败（超时/连接被拒）一律 close：socket 在 connect() 时就已存在，
+// 迟到的成功连接否则会一直挂到 isolate 结束
+async function dialWithTimeout(host, port, timeoutMs) {
+  const socket = connect({ hostname: host, port });
+  let won = false;
+  let timer = null;
+  try {
+    return await Promise.race([
+      socket.opened.then((v) => {
+        won = true;
+        return v;
+      }),
+      new Promise((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error("Connection timeout")),
+          timeoutMs,
+        );
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+    if (!won) {
+      try {
+        socket.close();
+      } catch {}
+    }
+  }
+}
+
 // 安全关闭 WebSocket
 function safeCloseWebSocket(ws) {
   try {
@@ -404,21 +434,12 @@ class StreamManager {
     try {
       this.log(`[${streamId}] 尝试${attemptDesc}: ${attemptHost}:${attemptPort}`);
 
-      const remoteSocket = connect({
-        hostname: attemptHost,
-        port: attemptPort,
-      });
-
-      // 添加超时控制
-      const timeoutPromise = new Promise((_, reject) => {
-        setTimeout(
-          () => reject(new Error("Connection timeout")),
-          this.config.connectTimeout,
-        );
-      });
-
-      // 等待连接建立或超时
-      await Promise.race([remoteSocket.opened, timeoutPromise]);
+      // 等待连接建立或超时；超时/失败一律回收 socket（否则迟到的连接会挂到 isolate 结束）
+      const remoteSocket = await dialWithTimeout(
+        attemptHost,
+        attemptPort,
+        this.config.connectTimeout,
+      );
 
       const remoteWriter = remoteSocket.writable.getWriter();
       const remoteReader = remoteSocket.readable.getReader();
