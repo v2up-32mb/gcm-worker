@@ -235,6 +235,61 @@ for (const [label, worker] of VARIANTS) {
       assert.equal(sockets()[1].opts.hostname, "b.example");
     });
 
+    test("重复 CONNECT 并发：在途旧拨号不会绑到新流（回归：双 CONNECTED + socket 泄漏）", async () => {
+      // 第一次 CONNECT 拨号挂起，客户端不等 CONNECTED 就用同一 streamId 再发 CONNECT
+      setPolicy((opts) => (opts.hostname === "slow.example" ? "hang" : "open"));
+      const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "30000" } });
+      await server.fromClient(connectFrame(5, "slow.example", 443));
+      await waitFor(() => sockets().length === 1, { label: "首个 socket 在途" });
+      await server.fromClient(connectFrame(5, "fast.example", 443));
+      await waitFor(() => server.typesOf(5).includes(T.CONNECTED), { label: "新流 CONNECTED" });
+
+      // 旧拨号此刻才迟到兑现
+      sockets()[0].resolveOpened();
+      await new Promise((r) => setTimeout(r, 30));
+
+      assert.equal(sockets()[0].closed, true, "迟到 socket 必须被回收（回归：曾泄漏到 isolate 结束）");
+      assert.equal(sockets()[1].closed, false, "新流的 socket 不该被旧链关掉");
+      assert.equal(
+        server.typesOf(5).filter((t) => t === T.CONNECTED).length,
+        1,
+        "同一 streamId 只应有一个 CONNECTED（回归：曾双发）",
+      );
+    });
+
+    test("旧 pump 收尾不会判死同 id 的新流（回归：杂散 CLOSE 杀死健康流）", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(4, "a.example", 443));
+      await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "A CONNECTED" });
+      const sockA = sockets()[0];
+      // 同 id 重建新流
+      await server.fromClient(connectFrame(4, "b.example", 443));
+      await waitFor(() => sockets().length === 2, { label: "B socket" });
+      assert.equal(sockA.closed, true, "A 的 socket 已关");
+
+      // A 的 pump 因 releaseLock 结算，尝试收尾；它不得发 CLOSE 打死 B
+      const before = server.typesOf(4).length;
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(sockA.closed, true);
+      assert.equal(sockets()[1].closed, false, "B 的 socket 不该被 A 的 pump 收尾关掉");
+      const after = server.typesOf(4);
+      assert.equal(after.filter((t) => t === T.CLOSE).length, 0, `旧 pump 不得发 CLOSE（frames: ${JSON.stringify(after.slice(before))}）`);
+    });
+
+    test("流被客户端 CLOSE 后不再继续拨打剩余回退出口（回归：会话已死仍耗尽回退链）", async () => {
+      setPolicy(() => "hang");
+      const { server } = await openSession(worker, {
+        envVars: { CONNECT_TIMEOUT: "30000", FALLBACK_IPS: "b1.example,b2.example,b3.example" },
+      });
+      await server.fromClient(connectFrame(1, "direct.example", 443));
+      await waitFor(() => sockets().length === 1, { label: "首个在途 socket" });
+      await server.fromClient(frame(1, T.CLOSE));
+      // 让第一条拨号链此刻失败：修复后应停手，修复前会接着把 b1..b3 全拨一遍
+      sockets()[0].rejectOpened(new Error("refused"));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(sockets().length, 1, `流已关闭却还在拨号（回归：曾拨满整条回退链），实际 ${JSON.stringify(sockets().map((s) => s.opts.hostname))}`);
+    });
+
     test("超过 MAX_STREAMS_PER_CONNECTION 直接回 CLOSE", async () => {
       const { server } = await openSession(worker, { envVars: { MAX_STREAMS_PER_CONNECTION: "1" } });
       await server.fromClient(connectFrame(1, "a.example", 443));
@@ -250,6 +305,16 @@ for (const [label, worker] of VARIANTS) {
       await waitFor(() => server.typesOf(4).includes(T.CONNECTED));
       await server.fromClient(frame(4, T.CLOSE));
       await waitFor(() => sockets()[0].closed, { label: "socket 关闭" });
+    });
+
+    test("重复 CONNECT 用例补断言：新流确实拿到 CONNECTED 且 socket 未被旧链误关", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(9, "a.example", 443));
+      await waitFor(() => server.typesOf(9).includes(T.CONNECTED));
+      await server.fromClient(connectFrame(9, "b.example", 443));
+      await waitFor(() => server.typesOf(9).filter((t) => t === T.CONNECTED).length === 2);
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(sockets()[1].closed, false, "新流 socket 不应被旧链收尾关掉");
     });
 
     test("短包与未知类型只记日志、不拆会话", async () => {

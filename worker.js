@@ -336,14 +336,18 @@ class StreamManager {
     // 预注册 stream（乐观模式）：TCP 尚未连上时缓存客户端早期数据
     // 客户端在发 CONNECT 后会乐观发送 SOCKS5 成功并开始转发数据
     // 这些数据可能在 CONNECTED 之前到达，需要缓存等 TCP 连上后 flush
-    this.streams.set(streamId, {
+    // 注意：stream 对象本身是"这一代流"的身份凭据——重复 CONNECT 会换新对象，
+    // 在途的 tryDial/pump 回来时必须按对象身份判定自己是否已被换掉（见 tryDial/pump）
+    const stream = {
+      id: streamId,
       remoteSocket: null,
       remoteWriter: null,
       remoteReader: null,
       isClosed: false,
       tcpConnected: false,
       pendingBuffer: [],
-    });
+    };
+    this.streams.set(streamId, stream);
     this.streamCount++;
 
     const target = parseAddress(targetAddr);
@@ -351,14 +355,14 @@ class StreamManager {
       // 目标地址非法：没有可试的出口，回 CLOSE 让客户端立即失败（不再无谓遍历回退列表）
       this.log(`[${streamId}] 目标地址不可解析: ${targetAddr}`);
       this.sendClose(streamId);
-      this.closeStream(streamId);
+      this.closeStreamObject(stream);
       return false;
     }
     const { host, port } = target;
     // 出口顺序：直连 > 客户端传入 fallback > 动态节点 > 静态 fallback
     // 1. 直连优先
     {
-      const r = await this.tryDial(streamId, host, port, "直连");
+      const r = await this.tryDial(stream, host, port, "直连");
       if (r === "connected") return true;
       if (r === "aborted") return false;
     }
@@ -383,7 +387,7 @@ class StreamManager {
         }
         if (markOrSeen(parsed)) continue;
         const r = await this.tryDial(
-          streamId,
+          stream,
           parsed.host,
           parsed.port,
           `query-fallback[${i + 1}/${queries.length}]`,
@@ -392,8 +396,9 @@ class StreamManager {
         if (r === "aborted") return false;
       }
 
-      // 3. 动态节点
+      // 3. 动态节点（拉取可能耗时，await 后要复查流是否还在）
       const dynamics = await getDynamicFallbacks(this.config);
+      if (stream.isClosed) return false;
       let dynIndex = 0;
       for (const entry of dynamics) {
         const parsed = parseFallbackEntry(entry, port);
@@ -401,7 +406,7 @@ class StreamManager {
         if (markOrSeen(parsed)) continue;
         dynIndex++;
         const r = await this.tryDial(
-          streamId,
+          stream,
           parsed.host,
           parsed.port,
           `dynamic[${dynIndex}/${dynamics.length}]`,
@@ -420,7 +425,7 @@ class StreamManager {
         }
         if (markOrSeen(parsed)) continue;
         const r = await this.tryDial(
-          streamId,
+          stream,
           parsed.host,
           parsed.port,
           `fallback[${i + 1}/${statics.length}]`,
@@ -432,15 +437,18 @@ class StreamManager {
 
     // 所有尝试都失败：回 CLOSE 让客户端立即失败（否则客户端只能等自己的超时），再清理预注册的流
     this.sendClose(streamId);
-    this.closeStream(streamId);
+    this.closeStreamObject(stream);
     return false;
   }
 
   /**
    * 单次拨号并绑定到流
+   * @param {object} stream 本代流对象（身份凭据：await 回来后据此判断自己是否已被换掉）
    * @returns {Promise<"connected" | "aborted" | "failed">} connected=成功停手，aborted=流已没（停手不再试），failed=可试下一个
    */
-  async tryDial(streamId, attemptHost, attemptPort, attemptDesc) {
+  async tryDial(stream, attemptHost, attemptPort, attemptDesc) {
+    const streamId = stream.id;
+    if (stream.isClosed) return "aborted";
     try {
       this.log(`[${streamId}] 尝试${attemptDesc}: ${attemptHost}:${attemptPort}`);
 
@@ -454,10 +462,10 @@ class StreamManager {
       const remoteWriter = remoteSocket.writable.getWriter();
       const remoteReader = remoteSocket.readable.getReader();
 
-      // 更新已预注册的 stream：绑定真实的 socket 并 flush 缓存数据
-      const stream = this.streams.get(streamId);
-      if (!stream || stream.isClosed) {
-        // 在 TCP 连接过程中流已被关闭
+      // 身份校验：等待期间流可能已被关闭、或被同 streamId 的新 CONNECT 换掉。
+      // 按 streamId 回表会误绑到新一代流上（双 CONNECTED + socket 泄漏 + 跨流串数据），
+      // 因此这里比对象身份，不一致就回收自己的 socket 后退出。
+      if (stream.isClosed || this.streams.get(streamId) !== stream) {
         try { remoteWriter.releaseLock(); } catch {}
         try { remoteSocket.close(); } catch {}
         return "aborted";
@@ -465,7 +473,6 @@ class StreamManager {
       stream.remoteSocket = remoteSocket;
       stream.remoteWriter = remoteWriter;
       stream.remoteReader = remoteReader;
-      stream.tcpConnected = true;
 
       this.log(`[${streamId}] ${attemptDesc}成功`);
 
@@ -477,22 +484,29 @@ class StreamManager {
             await remoteWriter.write(pending);
           } catch (e) {
             this.log(`[${streamId}] flush 写入失败: ${e.message}`);
-            this.closeStream(streamId);
+            // 尚未 sendConnected，也没有 pump 兜底发 CLOSE，必须自己回一帧让客户端快速失败
+            this.sendClose(streamId);
+            this.closeStreamObject(stream);
             return "aborted";
           }
         }
         stream.pendingBuffer = [];
       }
 
+      // 必须等 flush 结束再置位：flush 期间到达的客户端 DATA 要继续进 pendingBuffer，
+      // 否则会插到未写完的缓存条目中间，破坏发往目标的字节序（TLS/HTTP 会被判协议错误）
+      stream.tcpConnected = true;
+
       this.sendConnected(streamId);
 
       // 启动数据转发
-      this.pumpRemoteToWebSocket(streamId, remoteReader);
+      this.pumpRemoteToWebSocket(stream, remoteReader);
 
       return "connected";
     } catch (err) {
       this.log(`[${streamId}] ${attemptDesc}失败: ${err.message}`);
-      return "failed";
+      // 流已死（客户端 CLOSE / WS 关闭 / 被同 id 新流换掉）就停手，别再遍历剩余出口
+      return stream.isClosed || this.streams.get(streamId) !== stream ? "aborted" : "failed";
     }
   }
 
@@ -511,6 +525,7 @@ class StreamManager {
     if (!stream || stream.isClosed) {
       return false;
     }
+
 
     // TCP 尚未连上时缓存数据，等连接成功后 flush
     if (!stream.tcpConnected) {
@@ -534,10 +549,17 @@ class StreamManager {
   }
 
   /**
-   * 关闭流
+   * 按 id 关闭流（客户端 CLOSE / 重复 CONNECT 时用）
    */
   closeStream(streamId) {
-    const stream = this.getStream(streamId);
+    this.closeStreamObject(this.getStream(streamId));
+  }
+
+  /**
+   * 按对象关闭流：只回收自己的资源，只有仍是该 id 的现任流才从表里摘除
+   * （避免旧代收尾把同 id 的新流误删、误占 streamCount 槽位）
+   */
+  closeStreamObject(stream) {
     if (!stream || stream.isClosed) return;
 
     stream.isClosed = true;
@@ -555,10 +577,11 @@ class StreamManager {
       stream.remoteSocket?.close();
     } catch {}
 
-    this.streams.delete(streamId);
-    this.streamCount--;
-
-    this.log(`[${streamId}] 流已关闭，剩余流: ${this.streamCount}`);
+    if (this.streams.get(stream.id) === stream) {
+      this.streams.delete(stream.id);
+      this.streamCount--;
+      this.log(`[${stream.id}] 流已关闭，剩余流: ${this.streamCount}`);
+    }
   }
 
   /**
@@ -605,13 +628,17 @@ class StreamManager {
 
   /**
    * 将远程 Socket 数据转发给 WebSocket
+   * 收尾（CLOSE/删表）前先校验对象身份：旧代的 pump 不能把新一代的同 id 流判死
    */
-  async pumpRemoteToWebSocket(streamId, remoteReader) {
+  async pumpRemoteToWebSocket(stream, remoteReader) {
+    const streamId = stream.id;
     try {
       while (true) {
         const { done, value } = await remoteReader.read();
 
         if (done) break;
+        // 流已被换掉/关闭：停止转发并回收，别把旧源的字节记到新流名下
+        if (stream.isClosed || this.streams.get(streamId) !== stream) break;
         if (value?.byteLength > 0) {
           this.sendData(streamId, value);
         }
@@ -620,9 +647,11 @@ class StreamManager {
       this.log(`[${streamId}] 转发异常: ${e.message}`);
     }
 
-    // 转发结束，关闭流
-    this.sendClose(streamId);
-    this.closeStream(streamId);
+    // 转发结束，关闭流（仅当自己仍是对应 id 的现任流）
+    if (this.streams.get(streamId) === stream) {
+      this.sendClose(streamId);
+    }
+    this.closeStreamObject(stream);
   }
 
   /**
