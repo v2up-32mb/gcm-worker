@@ -47,15 +47,30 @@ Dashboard 粘贴部署（最快，无需本地环境）见 [`DEPLOY.md`](DEPLOY.
 |---|---|
 | `worker.js` | Worker 主脚本，**单文件自包含**（无构建步骤、无运行时依赖），头部注释即接入与协议说明 |
 | `DEPLOY.md` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |
+| `scripts/build.mjs` | 构建 snippets 压缩版 + 体积预算；`buildTestable()` 产出测试可加载的模块 |
 | `scripts/check-protocol.mjs` | 与 gcm `protocol/message.go` 比对消息类型/头长度，防协议漂移 |
+| `test/` | Node 侧替身与 105 条用例（可读版与压缩版跑同一套） |
 | `wrangler.toml.example` | Wrangler 配置模板（真实 `wrangler.toml` 不入库） |
+
+## 两种发布产物
+
+| 产物 | 体积 | 用途 |
+|---|---|---|
+| `worker.js` | 约 33 KiB（gzip 12 KiB） | 常规部署：Dashboard 粘贴、`wrangler deploy` |
+| `worker.snippets.min.js` | 约 12 KiB（gzip 5 KiB） | **Cloudflare Snippets** 等对脚本体积有限制的场景 |
+
+压缩版由 `npm run build` 生成（去注释/空白/标识符，并折叠伪装页 HTML 空白；
+`cloudflare:sockets` 保持外部导入）。**两者行为完全一致**——CI 用同一套用例同时跑两个产物，
+任一行为差异都会让 CI 失败，因此压缩版不是"另写一份"，而是同一份源码的构建结果。
 
 ## 测试
 
 ```bash
-npm run check          # node --check（语法）+ 协议一致性检查
+npm run check          # 语法 + 跨仓协议一致性 + 105 条用例（可读版 & 压缩版）
 npm run check:syntax   # 仅语法
 npm run check:protocol # 仅协议一致性（未检出 gcm 库仓时降级为自检并提示）
+npm test               # 仅用例
+npm run size           # 构建压缩版并对照体积预算（raw ≤16KiB / gzip ≤6KiB，超限退出码 1）
 ```
 
 端到端：本地 `wrangler dev` 后用 gcm-cli 指向 `ws://localhost:8787/<USER_ID>` 跑一次代理。

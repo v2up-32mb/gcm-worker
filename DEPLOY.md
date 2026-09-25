@@ -6,6 +6,16 @@ Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用�
 - 协议规范：[`gcm` 库仓](https://github.com/v2up-32mb/gcm) `protocol/message.go`（权威定义）
 - 客户端：[`gcm-cli`](https://github.com/v2up-32mb/gcm-cli) / [`x-client`](https://github.com/v2up-32mb/x-client)（Android）
 
+## 选择哪个产物
+
+| 产物 | 用途 |
+|---|---|
+| `worker.js`（可读版，约 33 KiB） | 常规部署：下面的方式一/方式二都用它 |
+| `worker.snippets.min.js`（压缩版，约 12 KiB / gzip 5 KiB） | Cloudflare **Snippets** 等对脚本体积有限制的场景 |
+
+两者行为完全一致（CI 用同一套 105 条用例同时跑两个产物）。压缩版随 release 一起发布，
+也可本地 `npm run build` 重建——**它是构建产物，不要手改**。
+
 ## 方式一：Dashboard 粘贴（最快）
 
 1. Cloudflare Dashboard → Workers & Pages → Create Worker

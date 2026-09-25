@@ -38,8 +38,6 @@
 import { connect } from "cloudflare:sockets";
 
 // ==================== 常量 ====================
-const WS_READY_STATE_OPEN = 1;
-const WS_READY_STATE_CLOSING = 2;
 
 // 早期数据缓存里每帧除 payload 外还有 Uint8Array/数组槽开销，按此计费，
 // 否则空帧（payload 0 字节）能零成本绕过 MAX_PENDING_BYTES
@@ -58,11 +56,14 @@ const DEFAULT_CONFIG = {
   dynamicNodesTimeout: 3000, // 拉取动态列表超时 3s，失败直接降级
 };
 
+const ENV_TRUE = new Set(["1", "true", "yes", "on"]);
+const ENV_FALSE = new Set(["0", "false", "no", "off"]);
+
 function parseEnvBool(v, fallback) {
   if (v === undefined || v === null || String(v).trim() === "") return fallback;
   const s = String(v).trim().toLowerCase();
-  if (["1", "true", "yes", "on"].includes(s)) return true;
-  if (["0", "false", "no", "off"].includes(s)) return false;
+  if (ENV_TRUE.has(s)) return true;
+  if (ENV_FALSE.has(s)) return false;
   return fallback;
 }
 
@@ -87,8 +88,6 @@ function buildConfigFromEnv(env) {
   };
 }
 
-// 保留空数组仅为兼容历史引用，静态 fallback 只从环境变量 FALLBACK_IPS 读取
-const DEFAULT_FALLBACK_IPS = [];
 
 // ==================== 消息类型常量 ====================
 const MSG_TYPE = {
@@ -193,6 +192,28 @@ function parseFallbackEntry(entry, defaultPort) {
   // 端口前的主机名不含冒号时，尾段才是端口（host:port）；否则整串是裸 IPv6，同样继承端口
   if (s.substring(0, sep).includes(":")) return { host: s, port: defaultPort };
   return withPort(s.substring(0, sep), s.substring(sep + 1));
+}
+
+// 逗号分隔的地址列表（?fallbackip= 与 FALLBACK_IPS 通用）
+function splitList(v) {
+  return String(v || "")
+    .split(",")
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// 大小写不敏感去重
+function dedupList(arr) {
+  const out = [];
+  const seen = new Set();
+  for (const h of arr) {
+    const key = h.toLowerCase();
+    if (!seen.has(key)) {
+      seen.add(key);
+      out.push(h);
+    }
+  }
+  return out;
 }
 
 // ==================== 动态兜底节点 ====================
@@ -318,12 +339,10 @@ async function dialWithTimeout(host, port, timeoutMs, onSocket) {
 }
 
 // 安全关闭 WebSocket
+// readyState: 0 CONNECTING / 1 OPEN / 2 CLOSING
 function safeCloseWebSocket(ws) {
   try {
-    if (
-      ws.readyState === WS_READY_STATE_OPEN ||
-      ws.readyState === WS_READY_STATE_CLOSING
-    ) {
+    if (ws.readyState === 1 || ws.readyState === 2) {
       ws.close(1000, "Server closed");
     }
   } catch {}
@@ -360,7 +379,7 @@ class StreamManager {
     // 检查最大并发流数
     if (this.streamCount >= this.config.maxStreamsPerConnection) {
       // 无独立错误帧：CLOSE 即表示该流已终止
-      this.sendClose(streamId);
+      this.sendFrame(streamId, MSG_TYPE.CLOSE);
       return false;
     }
 
@@ -410,68 +429,33 @@ class StreamManager {
     if (this.config.enableFallback) {
       // 去重集合：前面已试过的，后面不再重复试（直连已试过，播种进去）
       const seenHosts = new Set([`${host.toLowerCase()}:${port}`]);
-      const markOrSeen = (parsed) => {
-        const key = `${parsed.host.toLowerCase()}:${parsed.port}`;
-        if (seenHosts.has(key)) return true;
-        seenHosts.add(key);
-        return false;
-      };
 
-      // 2. 客户端传入的 fallback（?fallbackip=）
-      const queries = this.config.cfQueryFallbackIPs || [];
-      for (let i = 0; i < queries.length; i++) {
-        const parsed = parseFallbackEntry(queries[i], port);
-        if (!parsed) {
-          this.log(`[${streamId}] 跳过非法query-fallback[${i + 1}/${queries.length}]: ${queries[i]}`);
-          continue;
+      // 出口链 2~4 级，顺序即对外契约（AGENTS 约束 6）：
+      //   客户端 ?fallbackip= > 动态节点 API > 静态 FALLBACK_IPS
+      // 三级只有数据源与日志前缀不同，合并成一次遍历；动态节点要现拉，放在最前面惰性求值。
+      for (const [label, list] of [
+        ["query-fallback", this.config.cfQueryFallbackIPs || []],
+        ["dynamic", await getDynamicFallbacks(this.config)],
+        ["fallback", this.config.cfFallbackIPs || []],
+      ]) {
+        // 动态节点拉取可能耗时，await 之后要复查流是否还在
+        if (stream.isClosed) return false;
+        let n = 0;
+        for (const entry of list) {
+          const parsed = parseFallbackEntry(entry, port);
+          if (!parsed) {
+            this.log(`[${streamId}] 跳过非法${label}: ${entry}`);
+            continue;
+          }
+          const key = `${parsed.host.toLowerCase()}:${parsed.port}`;
+          if (seenHosts.has(key)) continue;
+          seenHosts.add(key);
+          n++;
+          const r = await this.tryDial(stream, parsed.host, parsed.port, `${label}[${n}/${list.length}]`);
+          if (r === "connected") return true;
+          if (r === "aborted") return false;
         }
-        if (markOrSeen(parsed)) continue;
-        const r = await this.tryDial(
-          stream,
-          parsed.host,
-          parsed.port,
-          `query-fallback[${i + 1}/${queries.length}]`,
-        );
-        if (r === "connected") return true;
-        if (r === "aborted") return false;
-      }
-
-      // 3. 动态节点（拉取可能耗时，await 后要复查流是否还在）
-      const dynamics = await getDynamicFallbacks(this.config);
-      if (stream.isClosed) return false;
-      let dynIndex = 0;
-      for (const entry of dynamics) {
-        const parsed = parseFallbackEntry(entry, port);
-        if (!parsed) continue;
-        if (markOrSeen(parsed)) continue;
-        dynIndex++;
-        const r = await this.tryDial(
-          stream,
-          parsed.host,
-          parsed.port,
-          `dynamic[${dynIndex}/${dynamics.length}]`,
-        );
-        if (r === "connected") return true;
-        if (r === "aborted") return false;
-      }
-
-      // 4. 静态 fallback（仅 env.FALLBACK_IPS）
-      const statics = this.config.cfFallbackIPs || [];
-      for (let i = 0; i < statics.length; i++) {
-        const parsed = parseFallbackEntry(statics[i], port);
-        if (!parsed) {
-          this.log(`[${streamId}] 跳过非法fallback[${i + 1}/${statics.length}]: ${statics[i]}`);
-          continue;
-        }
-        if (markOrSeen(parsed)) continue;
-        const r = await this.tryDial(
-          stream,
-          parsed.host,
-          parsed.port,
-          `fallback[${i + 1}/${statics.length}]`,
-        );
-        if (r === "connected") return true;
-        if (r === "aborted") return false;
+        this.log(`[${streamId}] ${label}: 尝试 ${n}/${list.length} 个出口`);
       }
     }
 
@@ -553,7 +537,7 @@ class StreamManager {
       // 否则会插到未写完的缓存条目中间，破坏发往目标的字节序（TLS/HTTP 会被判协议错误）
       stream.tcpConnected = true;
 
-      this.sendConnected(streamId);
+      this.sendFrame(streamId, MSG_TYPE.CONNECTED);
 
       // 启动数据转发
       this.pumpRemoteToWebSocket(stream, remoteReader);
@@ -655,31 +639,20 @@ class StreamManager {
   }
 
   /**
-   * 发送 CONNECTED 响应
+   * 发送一帧：[STREAM_ID:1][TYPE:1][可选 DATA]
+   * payload 为空时发 2 字节裸头（CONNECTED/CLOSE 按协议不带负载）
    */
-  sendConnected(streamId) {
+  sendFrame(streamId, type, payload) {
     try {
-      const header = new Uint8Array([
-        streamId, // Stream ID (1 byte)
-        MSG_TYPE.CONNECTED, // Type (1 byte)
-      ]);
-      this.webSocket.send(header);
-    } catch {}
-  }
-
-  /**
-   * 发送数据到客户端
-   */
-  sendData(streamId, data) {
-    try {
-      const header = new Uint8Array([
-        streamId, // Stream ID (1 byte)
-        MSG_TYPE.DATA, // Type (1 byte)
-      ]);
-      const combined = new Uint8Array(header.length + data.length);
-      combined.set(header);
-      combined.set(data, header.length);
-      this.webSocket.send(combined);
+      if (!payload || payload.length === 0) {
+        this.webSocket.send(new Uint8Array([streamId, type]));
+        return;
+      }
+      const frame = new Uint8Array(2 + payload.length);
+      frame[0] = streamId;
+      frame[1] = type;
+      frame.set(payload, 2);
+      this.webSocket.send(frame);
     } catch {}
   }
 
@@ -694,20 +667,7 @@ class StreamManager {
     const current = this.streams.get(stream.id);
     if (current && current !== stream) return;
     stream.closeNotified = true;
-    this.sendClose(stream.id);
-  }
-
-  /**
-   * 发送流关闭通知
-   */
-  sendClose(streamId) {
-    try {
-      const header = new Uint8Array([
-        streamId, // Stream ID (1 byte)
-        MSG_TYPE.CLOSE, // Type (1 byte)
-      ]);
-      this.webSocket.send(header);
-    } catch {}
+    this.sendFrame(stream.id, MSG_TYPE.CLOSE);
   }
 
   /**
@@ -724,7 +684,7 @@ class StreamManager {
         // 流已被换掉/关闭：停止转发并回收，别把旧源的字节记到新流名下
         if (stream.isClosed || this.streams.get(streamId) !== stream) break;
         if (value?.byteLength > 0) {
-          this.sendData(streamId, value);
+          this.sendFrame(streamId, MSG_TYPE.DATA, value);
         }
       }
     } catch (e) {
@@ -745,15 +705,6 @@ class StreamManager {
     }
   }
 
-  /**
-   * 获取统计信息
-   */
-  getStats() {
-    return {
-      activeStreams: this.streamCount,
-      maxStreams: this.config.maxStreamsPerConnection,
-    };
-  }
 }
 
 // ==================== 主入口 ====================
@@ -784,23 +735,6 @@ export default {
         // ?fallbackip=（客户端传入，支持逗号分隔与重复参数，每项支持 host 或 host:port）
         // env.FALLBACK_IPS（服务端静态，唯一来源）
         // 尝试顺序由 StreamManager.createStream() 按 直连 > 客户端 > 动态 > 静态 执行
-        const splitList = (v) =>
-          String(v || "")
-            .split(",")
-            .map((s) => s.trim())
-            .filter(Boolean);
-        const dedupList = (arr) => {
-          const out = [];
-          const seen = new Set();
-          for (const h of arr) {
-            const key = h.toLowerCase();
-            if (!seen.has(key)) {
-              seen.add(key);
-              out.push(h);
-            }
-          }
-          return out;
-        };
         const queryFallbackIPs = dedupList(
           url.searchParams.getAll("fallbackip").flatMap(splitList),
         );

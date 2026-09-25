@@ -28,7 +28,13 @@ gcm(Go 核心库: 客户端侧 2 字节头多路复用/连接池/流管理/中�
    收到未知消息类型只记 `logError`、**不清理会话**（保持与客户端兼容）；新增类型必须先改 gcm 库仓。
 3. **单文件自包含**：`worker.js` 保持单文件、无构建步骤、无运行时 npm 依赖
    （`cloudflare:sockets` 除外）——Dashboard 粘贴部署是首要路径，不要引入打包/多模块构建。
-   `package.json` 的依赖仅用于开发期（wrangler、测试）。不要引入 npm 包来解决本可内联的问题。
+   `package.json` 的依赖仅用于开发期（esbuild、wrangler、测试）。
+   **唯一的例外是发布用的压缩产物**：`npm run build` 生成的
+   `dist/worker.snippets.min.js`（Cloudflare Snippets 体积受限场景），它是同一份源码的构建结果，
+   不参与源码结构，不得手改；改行为一律改 `worker.js` 再重新构建。
+   压缩版与可读版跑同一套用例，行为不一致即 CI 失败。
+   压缩版体积受 `scripts/build.mjs` 的预算约束（raw ≤16KiB / gzip ≤6KiB），超限 CI 失败——
+   新增功能前先 `npm run size` 看余量。
 4. **秘密与部署配置不入库**：`wrangler.toml`（账号、域名、`[vars]`）留在本地/Cloudflare 侧，
    仓库只提供 `wrangler.toml.example`。`USER_ID` 等鉴权值绝不入库、绝不打默认值上线
    （`env.USER_ID` 缺省会退化成弱保护占位路径，README/DEPLOY.md 已注明生产必须设置）。
@@ -49,7 +55,8 @@ gcm(Go 核心库: 客户端侧 2 字节头多路复用/连接池/流管理/中�
 
 ## 发版流程（每个 tag 必修）
 
-1. 代码 + 检查通过：`npm run check` 全绿（语法 + 协议一致性），必要时 `wrangler deploy --dry-run`。
+1. 代码 + 检查通过：`npm run check` 与 `npm run size` 全绿（语法 + 协议一致性 + 用例 + 体积预算），
+   必要时 `wrangler deploy --dry-run`。
 2. `CHANGELOG.md` 记入该版本：变更分类 + 升级指引。
 3. `README.md` 能力/协议说明同步。
 4. **先向用户汇报版本号与发布内容并获批准**，才执行 `git tag` 与 `git push origin main --tags`。
@@ -61,14 +68,17 @@ gcm(Go 核心库: 客户端侧 2 字节头多路复用/连接池/流管理/中�
 |---|---|
 | `worker.js` | Worker 主脚本：路由鉴权、`StreamManager` 多路复用流、出口选路；单文件自包含，头部注释即接入与协议说明 |
 | `DEPLOY.md` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |
+| `scripts/build.mjs` | 压缩版构建（snippets）+ 体积预算 + 测试产物构建 |
 | `scripts/check-protocol.mjs` | 跨仓协议一致性检查（比对 gcm `protocol/message.go`），CI 强校验入口 |
+| `test/` | `cf-sockets-stub.mjs`（socket 替身）、`harness.mjs`（运行时替身与会话驱动）、`worker.test.mjs`（105 条用例） |
 | `wrangler.toml.example` | Wrangler 配置模板（真实 `wrangler.toml` 不入库） |
 | `package.json` | `check` / `check:syntax` / `check:protocol` / `dev` / `deploy` 脚本 |
 
 ## 测试
 
 ```bash
-npm run check
+npm run check    # 语法 + 跨仓协议 + 用例（可读版 & 压缩版）
+npm run size     # 压缩版体积预算
 ```
 
 端到端（手动）：`npx wrangler dev` + gcm-cli `--worker localhost:8787 --user-id <USER_ID>` 跑通一次代理

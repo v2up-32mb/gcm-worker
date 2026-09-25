@@ -12,12 +12,21 @@ jobs:
         with:
           node-version: '20'
 
+      # 测试需要 esbuild（把 worker.js 打成可加载的 ESM 以跑同一套用例）
+      - run: npm ci
+
       # Worker 主脚本语法（Dashboard 粘贴部署路径要求单文件可直接解析）
       - name: Syntax check
         run: npm run check:syntax
 
-      # 跨仓协议一致性：检出 gcm 库仓后比对 MSG_TYPE / HEADER_LEN
-      - name: Cross-repo protocol check
-        run: |
-          git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm
-          npm run check:protocol
+      # 端到端用例（可读版 + 压缩版同一套）+ 跨仓协议一致性
+      # 协议比对需检出 gcm 库仓
+      - name: Checkout gcm library
+        run: git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm
+
+      - name: Tests
+        run: npm run check:protocol && npm test
+
+      # 构建 snippets 产物并对照体积预算（超限即失败）
+      - name: Build snippets + size budget
+        run: npm run size

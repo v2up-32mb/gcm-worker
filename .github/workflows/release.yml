@@ -1,6 +1,8 @@
 name: Release
 
 # tag 触发：从 tag 检出，校验并把 Worker 服务端产物随 release 发布
+#   - dist/worker.js              可读版（Dashboard 粘贴 / 常规 Worker 部署）
+#   - dist/worker.snippets.min.js  压缩版（Cloudflare Snippets，体积受限场景）
 # workflow_dispatch：可为已存在的 tag 补发 release（tag_name 输入）
 
 on:
@@ -39,10 +41,14 @@ jobs:
         with:
           node-version: '20'
 
-      - name: Check (syntax + protocol)
-        run: |
-          git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm || true
-          npm run check
+      - run: npm ci
+
+      # 跨仓协议一致性需要 gcm 库仓
+      - name: Checkout gcm library
+        run: git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm
+
+      - name: Check (syntax + protocol + tests)
+        run: npm run check
 
       - name: Package worker
         run: |
@@ -51,6 +57,10 @@ jobs:
           cp DEPLOY.md dist/DEPLOY.md
           node --check dist/worker.js
           ls -la dist
+
+      # 压缩版（Snippets）：带体积预算校验，超限即不发版
+      - name: Build snippets + size budget
+        run: npm run size
 
       - name: Detect prerelease
         run: |
@@ -62,13 +72,18 @@ jobs:
 
       - name: Generate release notes
         run: |
+          RAW=$(stat -c%s dist/worker.snippets.min.js)
+          GZ=$(gzip -c dist/worker.snippets.min.js | wc -c)
           {
             echo "## GCM Worker 服务端"
             echo ""
-            echo "| 文件 | 说明 |"
+            echo "| 文件 | 用途 |"
             echo "|---|---|"
-            echo "| \`worker.js\` | Cloudflare Worker 主脚本（单文件自包含，\`node --check\` 与跨仓协议一致性已校验） |"
+            echo "| \`worker.js\` | 可读版（单文件自包含，Dashboard 粘贴 / 常规 Worker 部署） |"
+            echo "| \`worker.snippets.min.js\` | **压缩版**（${RAW} B / gzip ${GZ} B），用于 Cloudflare Snippets 等对脚本体积有限制的场景 |"
             echo "| \`DEPLOY.md\` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |"
+            echo ""
+            echo "两个版本行为完全一致：CI 用同一套 105 条用例同时跑可读版与压缩版，任一行为差异都会让发版失败。"
             echo ""
             echo "部署配置（\`wrangler.toml\`、域名与账号）不随发布提供，复制 \`wrangler.toml.example\` 自行准备。"
             echo ""
@@ -94,4 +109,5 @@ jobs:
           prerelease: ${{ env.IS_PRERELEASE }}
           files: |
             dist/worker.js
+            dist/worker.snippets.min.js
             dist/DEPLOY.md

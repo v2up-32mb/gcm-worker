@@ -10,6 +10,7 @@
     "check:protocol": "node scripts/check-protocol.mjs",
     "test": "node --test \"test/*.test.mjs\"",
     "build": "node scripts/build.mjs",
+    "size": "node scripts/build.mjs",
     "dev": "wrangler dev",
     "deploy": "wrangler deploy"
   },

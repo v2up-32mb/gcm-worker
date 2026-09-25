@@ -59,6 +59,26 @@
 - `DEPLOY.md` 新增"已知限制"：字节计量只覆盖上行，Workers 的 `WebSocket.send()` 没有积压查询接口，
   下行依赖运行时发送缓冲与 isolate 内存上限。
 
+**Added**
+
+- **压缩版产物**（`dist/worker.snippets.min.js`，随 release 一并发布）：Cloudflare Snippets 对脚本体积
+  有限制，压缩版约 12 KiB（gzip 5 KiB），可读版约 33 KiB。压缩由 `npm run build` 生成
+  （去注释/空白/标识符 + 折叠伪装页 HTML 空白，`cloudflare:sockets` 保持外部导入），
+  **与可读版跑同一套 105 条用例**，行为不一致即 CI 失败。体积预算 raw ≤16KiB / gzip ≤6KiB，
+  超限 CI 失败（`npm run size`）。
+- release 现在同时附 `worker.js`、`worker.snippets.min.js`、`DEPLOY.md` 三个文件；
+  CI 增加 `npm ci`（端到端用例需要 esbuild）与体积预算步骤。
+
+**Changed（体积优化，行为零变化）**
+
+- 删除死代码：`DEFAULT_FALLBACK_IPS`、`StreamManager.getStats()`（均无任何引用）。
+- `WS_READY_STATE_OPEN/CLOSING` 内联；`sendConnected`/`sendData`/`sendClose` 合并为单个
+  `sendFrame(streamId, type, payload)`（CONNECTED/CLOSE 仍发严格 2 字节裸头，协议不变）。
+- 出口链 2~4 级（?fallbackip / 动态节点 / 静态 FALLBACK_IPS）三段近乎逐字重复的循环
+  合并为一次表驱动遍历，**顺序即对外契约不变**（有用例断言完整链顺序）。
+- `splitList` / `dedupList` 从 `fetch()` 内提升到模块级（不再每请求重建闭包）；
+  `parseEnvBool` 的真值表改为模块级 `Set`。
+
 **Other**
 
 - 测试台对齐 Workers 真实语义：二进制按 ArrayBuffer 投递（覆盖生产唯一分支）、
