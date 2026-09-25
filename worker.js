@@ -19,6 +19,8 @@
  *
  * 出口顺序: 直连原始 host > 客户端 ?fallbackip= > 动态节点 API（env.DYNAMIC_NODES_URL）> 静态 fallback（env.FALLBACK_IPS，
  *   每项支持 host 或 host:port；无硬编码默认值）
+ *   注意：ENABLE_FALLBACK=false 会把第 2~4 级（?fallbackip=、动态节点、静态 FALLBACK_IPS）整体关闭，
+ *   只剩直连；ENABLE_DYNAMIC_NODES 可单独关闭动态节点这一级。
  *
  * 仓库: https://github.com/v2up-32mb/gcm-worker
  *   协议规范（消息类型/头长度）以 gcm 库仓 protocol/message.go 为准，改动前先看 AGENTS.md
@@ -203,8 +205,12 @@ let dynamicNodesCache = { entries: [], inflight: null, failedAt: 0 };
 function normalizeNodeEntry(host, port) {
   let h = String(host ?? "").trim();
   if (!h) return null;
-  // API 可能返回裸 IPv6，统一加方括号，后续走 parseFallbackEntry 解析
-  if (h.includes(":") && h[0] !== "[") h = `[${h}]`;
+  // API 可能返回裸 IPv6，统一加方括号，后续走 parseFallbackEntry 解析。
+  // 但 "host:port" 形态（address 字段常见）不能加括号，否则会被当成一个畸形主机名。
+  if (h.includes(":") && h[0] !== "[") {
+    const looksLikeHostPort = h.indexOf(":") === h.lastIndexOf(":") && /:\d+$/.test(h);
+    if (!looksLikeHostPort) h = `[${h}]`;
+  }
   if (port !== undefined && port !== null && String(port).trim() !== "") {
     const p = parseInt(port, 10);
     if (!Number.isSafeInteger(p) || p <= 0 || p > 65535) return null;
@@ -395,6 +401,12 @@ class StreamManager {
       if (r === "aborted") return false;
     }
 
+    if (!this.config.enableFallback) {
+      // 明确提示：ENABLE_FALLBACK=false 会连带关掉客户端 ?fallbackip= 与动态节点，
+      // 不只是静态 FALLBACK_IPS（避免运维以为客户端传的出口偏好仍然生效）
+      this.log("客户端 ?fallbackip= 与动态/静态回退已被 ENABLE_FALLBACK=false 全部关闭");
+    }
+
     if (this.config.enableFallback) {
       // 去重集合：前面已试过的，后面不再重复试（直连已试过，播种进去）
       const seenHosts = new Set([`${host.toLowerCase()}:${port}`]);
@@ -513,7 +525,10 @@ class StreamManager {
         this.log(`[${streamId}] flush ${stream.pendingBuffer.length} 条缓存数据`);
         for (const pending of stream.pendingBuffer) {
           try {
-            await remoteWriter.write(pending);
+            await remoteWriter.write(pending.chunk);
+            // 写出即释放额度：早期数据的计量只是"暂存"，写完必须回退，
+            // 否则这条流的在途预算被历史早期数据永久占用，后续正常 DATA 会被误杀
+            stream.pendingBytes -= pending.cost;
           } catch (e) {
             this.log(`[${streamId}] flush 写入失败: ${e.message}`);
             // 尚未 sendConnected，也没有 pump 兜底发 CLOSE，必须自己回一帧让客户端快速失败
@@ -582,7 +597,7 @@ class StreamManager {
     }
 
     if (!stream.tcpConnected) {
-      stream.pendingBuffer.push(chunk);
+      stream.pendingBuffer.push({ chunk, cost });
       return true;
     }
 

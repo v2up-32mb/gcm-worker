@@ -30,8 +30,8 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 |---|---|
 | `USER_ID` | 用户鉴权 ID（URL 路径 `/USER_ID`，**大小写不敏感**匹配；客户端 `--user-id` / `user_id` 需一致） |
 | `FALLBACK_IPS` | 静态出口回退代理，逗号分隔（每项 host 或 host:port） |
-| `ENABLE_FALLBACK` | 是否启用静态回退（`true`/`false`） |
-| `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表）；拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的负缓存窗口，窗口内复用 stale（无则为空）不再外呼 |
+| `ENABLE_FALLBACK` | 是否启用**全部回退出口**（`true`/`false`）：`false` 时只剩直连，客户端 `?fallbackip=`、动态节点、静态 `FALLBACK_IPS` 一并失效 |
+| `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表）；拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的负缓存窗口，窗口内复用 stale（无则为空）不再外呼。字段格式：`ip`/`host`/`address` 给纯主机或 IP（IPv6 可裸写或写 `[...]`），端口放独立 `port` 字段（`address` 自带 `host:port` 也支持） |
 | `ENABLE_DYNAMIC_NODES` / `DYNAMIC_NODES_TIMEOUT` | 动态节点开关与超时（毫秒） |
 | `CONNECT_TIMEOUT` | 出口连接超时（毫秒） |
 | `MAX_STREAMS_PER_CONNECTION` | 单 WebSocket 连接最大流数 |
@@ -44,4 +44,11 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 - **gcm-cli**：`gcm --worker <worker域名> --user-id <USER_ID> --relay <prefIP:port> --proxy-ip <fip>`
 - **x-client Android**：Profile 的 WorkerHost / UserID / PrefIp / FallbackIp 字段
 
-出口优先级：直连原始 host > 客户端 `?fallbackip=` > 动态节点 API > 静态 `FALLBACK_IPS`。
+出口优先级：直连原始 host > 客户端 `?fallbackip=` > 动态节点 API > 静态 `FALLBACK_IPS`
+（后三级仅在 `ENABLE_FALLBACK=true` 时生效，动态节点另受 `ENABLE_DYNAMIC_NODES` 控制）。
+
+## 已知限制
+
+- **下行不计量**：`MAX_PENDING_BYTES` 只管**上行**（客户端 → 目标，含预连接缓存与在途未确认写出）。
+  目标 → 客户端方向 Worker 侧不做字节/条数统计——Workers 的 `WebSocket.send()` 没有积压查询接口，
+  只能依赖运行时的发送缓冲与 isolate 内存上限。弱网客户端大流量下载时可能触发 isolate 被回收。

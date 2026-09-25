@@ -92,6 +92,11 @@ class FakeWS {
     this._deliver(data instanceof Uint8Array ? data : new Uint8Array(data));
   }
 
+  /** 触发 error 事件（真实 WebSocket 的传输层错误） */
+  emitError(message) {
+    for (const fn of this._ls.get("error") ?? []) fn({ message });
+  }
+
   /** 投递文本帧（真实 WebSocket 的文本消息 event.data 是 string） */
   deliverText(text) {
     for (const fn of this._ls.get("message") ?? []) fn({ data: text });

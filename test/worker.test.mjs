@@ -73,6 +73,12 @@ describe("纯函数", () => {
     assert.equal(n("1.2.3.4", "0"), null);
     assert.equal(n("1.2.3.4", "99999"), null);
     assert.equal(n("  ", ""), null);
+    // address 字段自带端口时不能加方括号，否则 connect 会拿到 "1.2.3.4:8081" 这种畸形主机名
+    assert.equal(n("1.2.3.4:8081", ""), "1.2.3.4:8081");
+    assert.equal(n("[2606:4700::1]:8081", ""), "[2606:4700::1]:8081");
+    const parsed = internals.parseFallbackEntry(n("1.2.3.4:8081", ""), 443);
+    assert.equal(parsed && parsed.host, "1.2.3.4", "自带端口的条目应被正确拆分出 host");
+    assert.equal(parsed && parsed.port, 8081, "自带端口的条目应被正确拆分出 port");
   });
 
   test("buildConfigFromEnv 解析布尔/整数并做范围钳制", () => {
@@ -204,6 +210,80 @@ for (const [label, worker] of VARIANTS) {
       await server.fromClient(connectFrame(3, "direct.example", 443));
       await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "全败 CLOSE" });
       assert.equal(sockets().length, 4, "直连 + 3 条被截断后的 query 回退（不再拨第 4 条起）");
+    });
+
+    test("flush 后在途额度释放：早期数据不永久占用预算（回归：健康长连流被误杀）", async () => {
+      // 预连接期灌 60KiB 早期数据（< 64KiB 上限），flush 完再发 8KiB：额度已释放则不得触发 CLOSE
+      setPolicy(() => "hang");
+      const { server } = await openSession(worker, {
+        envVars: { CONNECT_TIMEOUT: "30000", MAX_PENDING_BYTES: "65536" },
+      });
+      await server.fromClient(connectFrame(4, "slow.example", 443));
+      await server.fromClient(frame(4, T.DATA, new Uint8Array(60 * 1024)));
+      const sock = sockets()[0];
+      sock.resolveOpened();
+      await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "CONNECTED" });
+      await waitFor(() => sock.toTarget.length >= 1, { label: "早期数据已 flush" });
+
+      await server.fromClient(frame(4, T.DATA, new Uint8Array(8 * 1024)));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(server.typesOf(4).includes(T.CLOSE), false, `flush 后额度未释放，健康流被误杀（frames: ${JSON.stringify(server.typesOf(4))}）`);
+      assert.equal(sock.closed, false, "socket 不该被关");
+      await waitFor(() => sock.toTarget.length >= 2, { label: "后续 DATA 正常写出" });
+    });
+
+    test("出口优先级完整链：直连 > ?fallbackip > 动态节点 > 静态（对外契约）", async () => {
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = async () => ({ ok: true, status: 200, json: async () => ({ nodes: [{ ip: "dyn.example" }] }) });
+      try {
+        setPolicy(() => "reject");
+        const w = await freshWorker(worker === workers.min ? "min" : "dev");
+        const { server } = await openSession(w, {
+          query: "?fallbackip=q.example",
+          envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api", FALLBACK_IPS: "static.example" },
+        });
+        await server.fromClient(connectFrame(9, "direct.example", 443));
+        await waitFor(() => server.typesOf(9).includes(T.CLOSE), { label: "全链失败 CLOSE" });
+        assert.deepEqual(
+          sockets().map((s) => s.opts.hostname),
+          ["direct.example", "q.example", "dyn.example", "static.example"],
+          "出口顺序是 AGENTS 约束 6 的对外契约",
+        );
+      } finally {
+        globalThis.fetch = realFetch;
+      }
+    });
+
+    test("对不存在的 streamId 发 DATA/CLOSE：零回帧且不占槽位", async () => {
+      const { server } = await openSession(worker, { envVars: { MAX_STREAMS_PER_CONNECTION: "1" } });
+      const before = server.sent.length;
+      await server.fromClient(frame(77, T.DATA, "x"));
+      await server.fromClient(frame(78, T.CLOSE));
+      await new Promise((r) => setTimeout(r, 30));
+      assert.equal(server.sent.length, before, `不存在的流不应有回帧（frames: ${JSON.stringify(server.frames().slice(before))}）`);
+      assert.equal(server.closed, null, "不应拆会话");
+      // 槽位没被占：仍能建流
+      await server.fromClient(connectFrame(1, "a.example", 443));
+      await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: "槽位未被占用" });
+    });
+
+    test("streamId 0 与 255 端到端可用（客户端首个流号就是 0）", async () => {
+      const { server } = await openSession(worker);
+      for (const id of [0, 255]) {
+        await server.fromClient(connectFrame(id, `h${id}.example`, 443));
+        await waitFor(() => server.typesOf(id).includes(T.CONNECTED), { label: `streamId ${id} CONNECTED` });
+        await server.fromClient(frame(id, T.DATA, `d${id}`));
+        await waitFor(() => sockets()[id === 0 ? 0 : 1].toTarget.length === 1, { label: `streamId ${id} DATA` });
+      }
+    });
+
+    test("WebSocket error 事件：回收所有流并关闭会话", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(1, "a.example", 443));
+      await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: "CONNECTED" });
+      server.emitError("unexpected transport error");
+      await waitFor(() => sockets()[0].closed, { label: "socket 回收" });
+      assert.ok(server.closed, "error 后应关闭 WebSocket");
     });
 
     test("连接超时会回收 socket 并转试下一个出口", async () => {

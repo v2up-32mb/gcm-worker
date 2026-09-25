@@ -24,7 +24,8 @@ TYPE = 3 CLOSE      无 DATA
 （`USER_ID` 取环境变量，路径小写匹配；`?fallbackip=` 可重复/逗号分隔，每项 `host` 或 `host:port`）。
 
 出口顺序：**直连原始 host > 客户端 `?fallbackip=` > 动态节点 API（`DYNAMIC_NODES_URL`）>
-静态 `FALLBACK_IPS`**。
+静态 `FALLBACK_IPS`**（后三级在 `ENABLE_FALLBACK=false` 时整体关闭，动态节点另受
+`ENABLE_DYNAMIC_NODES` 控制）。字节计量只覆盖上行，下行依赖运行时缓冲——见 `DEPLOY.md` 已知限制。
 
 常量的权威定义在 gcm 库仓 `protocol/message.go`；本仓用
 `npm run check:protocol` 与之比对，防止两侧漂移（详见 `AGENTS.md`）。

@@ -33,6 +33,12 @@
 - **动态节点失败负缓存**：拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的窗口，窗口内直接复用
   stale（无 stale 即空），不再每条流空等满 `DYNAMIC_NODES_TIMEOUT` 才拨静态回退、
   也不对故障 API 反复发 subrequest。
+- **[本轮自引入的回归，已修]** flush 早期数据后 `pendingBytes` 不回退：早期数据的额度被永久占用，
+  累计早期数据一旦接近 `MAX_PENDING_BYTES`，这条健康的长连流后续任何正常 DATA 都会被误判超限而
+  回 CLOSE 掐掉。现在 pendingBuffer 元素携带计费额，flush 逐条写出后回退额度。
+- **动态节点 `address` 自带端口不再被误当裸 IPv6**：`normalizeNodeEntry` 此前对任何含冒号的值
+  加方括号，`"9.9.9.9:8081"` 会变成 `"[9.9.9.9:8081]"`，最终 `connect()` 拿到畸形主机名、整层
+  动态出口静默失效。现在「恰好一个冒号且尾段是数字」按 `host:port` 原样透传。
 - **日志净化**：客户端可控内容（CONNECT 负载、`?fallbackip=` 条目）原样进日志行，
   可注入换行/ANSI 伪造运维记录；现统一在 `log`/`logError` 内剥控制字符并截断到 200 字符。
 - **USER_ID 大小写不敏感**：此前只把 `env.USER_ID` 小写化，客户端把 `--user-id` 原样放进路径，
@@ -45,11 +51,19 @@
 - `MAX_FALLBACK_IPS`（`?fallbackip=` 条数上限，默认 16，1–64）——此前无上限，
   一条 CONNECT 就能把拨号链拉到分钟级并占满流槽位。
 
+**Docs**
+
+- `ENABLE_FALLBACK` 语义澄清：它关掉的是**全部**回退出口（客户端 `?fallbackip=`、动态节点、
+  静态 `FALLBACK_IPS`），不只是文档此前写的"静态回退"。行为未变（保持兼容），但补了运行时提示日志，
+  并同步 README / DEPLOY.md / worker.js 头部注释。
+- `DEPLOY.md` 新增"已知限制"：字节计量只覆盖上行，Workers 的 `WebSocket.send()` 没有积压查询接口，
+  下行依赖运行时发送缓冲与 isolate 内存上限。
+
 **Other**
 
 - 测试台对齐 Workers 真实语义：二进制按 ArrayBuffer 投递（覆盖生产唯一分支）、
   异步 sink（可观察写序竞态）、写/读失败注入、独立模块实例（隔离动态节点 stale 缓存）。
-  45 → 87 条用例，压缩版与可读版跑同一套。
+  45 → 105 条用例，压缩版与可读版跑同一套。
 - 跨列表去重：回退列表里与直连 host:port 相同的条目不再被重复拨一次。
 
 **升级指引**：协议格式与出口优先级未变，客户端无需改动。行为差异（均为修复方向）：
