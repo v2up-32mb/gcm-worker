@@ -8,10 +8,23 @@
 //   "reject"  —— opened 拒绝（连接被拒）
 //   "hang"    —— opened 永不结算（触发 connectTimeout 超时路径）
 // 其它返回值视为未知 → 按 "reject" 处理。
+//
+// hooks.write(rec, chunk) —— 注入写延迟（返回 promise 则等待）或写失败（抛错）。
+//   真实 socket 的 write 天然跨任务结算，替身若同步 push 会掩盖写序竞态，故默认也是异步的。
+// rec.failToClient(err)   —— 让远端 → 客户端方向以错误结束（模拟 RST）。
 
 function state() {
   if (!globalThis.__CF_STUB__) {
-    globalThis.__CF_STUB__ = { sockets: [], policy: null, reset() { this.sockets = []; this.policy = null; } };
+    globalThis.__CF_STUB__ = {
+      sockets: [],
+      policy: null,
+      hooks: { write: null },
+      reset() {
+        this.sockets = [];
+        this.policy = null;
+        this.hooks = { write: null };
+      },
+    };
   }
   return globalThis.__CF_STUB__;
 }
@@ -21,12 +34,13 @@ export function connect(opts) {
   const rec = {
     opts,
     closed: false,
-    toTarget: [],       // 客户端 DATA 经 writable 写入的字节
+    toTarget: [], // 客户端 DATA 经 writable 写入的字节
     writes: 0,
     resolveOpened: null,
     rejectOpened: null,
     enqueueToClient: null,
     eofToClient: null,
+    failToClient: null,
   };
   s.sockets.push(rec);
 
@@ -38,19 +52,35 @@ export function connect(opts) {
   // 未处理的 opened 拒绝不应影响测试进程
   opened.catch(() => {});
 
+  // Cloudflare 语义：socket.opened 兑现为 socket 自身
+  rec.resolveOpened = () => openedResolve(socket);
+  rec.rejectOpened = (err) => openedReject(err || new Error("connect refused"));
+
   const socket = {
     opened,
     readable: new ReadableStream({
       start(controller) {
         rec.enqueueToClient = (bytes) => controller.enqueue(new Uint8Array(bytes));
-        rec.eofToClient = () => controller.close();
+        rec.eofToClient = () => {
+          try {
+            controller.close();
+          } catch {}
+        };
+        rec.failToClient = (err) => {
+          try {
+            controller.error(err || new Error("read error"));
+          } catch {}
+        };
       },
       cancel() {
+        rec.enqueueToClient = null;
         rec.eofToClient = null;
+        rec.failToClient = null;
       },
     }),
     writable: new WritableStream({
-      write(chunk) {
+      async write(chunk) {
+        if (s.hooks.write) await s.hooks.write(rec, chunk);
         rec.writes++;
         rec.toTarget.push(new Uint8Array(chunk));
       },
@@ -67,14 +97,11 @@ export function connect(opts) {
     },
   };
 
-  // Cloudflare 语义：socket.opened 兑现为 socket 自身
-  rec.resolveOpened = () => openedResolve(socket);
-  rec.rejectOpened = (err) => openedReject(err || new Error("connect refused"));
-
   const mode = s.policy ? s.policy(opts, rec) : "open";
   if (mode === "open") rec.resolveOpened();
-  else if (mode === "hang") { /* 保持 pending，等 worker 侧超时 */ }
-  else rec.rejectOpened(new Error(`connect refused: ${opts.hostname}:${opts.port}`));
+  else if (mode === "hang") {
+    /* 保持 pending，等 worker 侧超时 */
+  } else rec.rejectOpened(new Error(`connect refused: ${opts.hostname}:${opts.port}`));
 
   return socket;
 }

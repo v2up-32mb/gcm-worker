@@ -8,6 +8,7 @@ import { buildTestable, REPO_ROOT } from "../scripts/build.mjs";
 const TMP = join(REPO_ROOT, "test/.tmp");
 
 let cached = null;
+let freshSeq = 0;
 
 /** 构建并加载可读版 + 压缩版 worker 模块（同一份源码的两种产物） */
 export async function loadWorkers() {
@@ -18,6 +19,18 @@ export async function loadWorkers() {
   const minMod = await import(pathToFileURL(min).href);
   cached = { dev: devMod.default, min: minMod.default, devFile: dev, minFile: min };
   return cached;
+}
+
+/**
+ * 载入 worker 模块的**全新实例**（带 cache-busting query）。
+ * worker.js 有模块级可变状态（动态节点 stale 缓存），用例之间共享会互相污染，
+ * 需要独立状态的用例必须各自拿一份新实例。
+ */
+export async function freshWorker(variant = "dev") {
+  const w = await loadWorkers();
+  const file = variant === "min" ? w.minFile : w.devFile;
+  const mod = await import(pathToFileURL(file).href + `?fresh=${++freshSeq}`);
+  return mod.default;
 }
 
 // ---------- Workers 运行时替身 ----------
@@ -63,9 +76,23 @@ class FakeWS {
   _emit(type, ev) {
     for (const fn of this._ls.get(type) ?? []) fn(ev);
   }
-  /** 客户端 → 服务端：只投递不等处理完（与真实事件模型一致：每条消息是独立任务） */
+  /**
+   * 客户端 → 服务端：只投递不等处理完（与真实事件模型一致：每条消息是独立任务）。
+   * 二进制消息按 Workers 真实语义投递 ArrayBuffer——worker.js 里
+   * `data instanceof ArrayBuffer ? new Uint8Array(data) : data` 这条生产分支必须被覆盖到。
+   */
   fromClient(data) {
     const payload = data instanceof Uint8Array ? data : new Uint8Array(data);
+    const ab = payload.buffer.slice(payload.byteOffset, payload.byteOffset + payload.byteLength);
+    this._deliver(ab);
+  }
+
+  /** 按原样投递（Uint8Array 等非 ArrayBuffer 形态），用于覆盖归一化兜底分支 */
+  fromClientRaw(data) {
+    this._deliver(data instanceof Uint8Array ? data : new Uint8Array(data));
+  }
+
+  _deliver(payload) {
     for (const fn of this._ls.get("message") ?? []) fn({ data: payload });
   }
   frames() {
@@ -154,6 +181,33 @@ export function sockets() {
   return globalThis.__CF_STUB__?.sockets ?? [];
 }
 
+/** 确保替身状态存在且字段齐全（用例不再手搓状态对象，避免漏字段） */
+export function ensureStub() {
+  if (!globalThis.__CF_STUB__) {
+    globalThis.__CF_STUB__ = {
+      sockets: [],
+      policy: null,
+      hooks: { write: null },
+      reset() {
+        this.sockets = [];
+        this.policy = null;
+        this.hooks = { write: null };
+      },
+    };
+  }
+  return globalThis.__CF_STUB__;
+}
+
 export function resetStub() {
-  globalThis.__CF_STUB__?.reset();
+  ensureStub().reset();
+}
+
+/** 设置连接策略：(opts, rec) => "open" | "reject" | "hang" */
+export function setPolicy(fn) {
+  ensureStub().policy = fn;
+}
+
+/** 注入写延迟/写失败：hook 返回 promise 则等待完成，抛错则写入失败 */
+export function setWriteHook(fn) {
+  ensureStub().hooks.write = fn;
 }

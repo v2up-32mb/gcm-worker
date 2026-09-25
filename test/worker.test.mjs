@@ -6,7 +6,8 @@
 import { test, describe, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import {
-  loadWorkers, openSession, connectFrame, frame, T, waitFor, sockets, resetStub, env,
+  loadWorkers, openSession, connectFrame, frame, T, waitFor, sockets, resetStub, setPolicy, setWriteHook,
+  freshWorker, env,
 } from "./harness.mjs";
 
 const workers = await loadWorkers();
@@ -108,7 +109,6 @@ for (const [label, worker] of VARIANTS) {
   describe(`端到端 [${label}]`, () => {
     beforeEach(() => {
       resetStub();
-      globalThis.__CF_STUB__ = undefined;
     });
 
     test("路径不匹配返回 403 伪装页", async () => {
@@ -155,7 +155,7 @@ for (const [label, worker] of VARIANTS) {
     });
 
     test("TCP 未连上时的早期 DATA 被缓存并在连上后 flush", async () => {
-      globalThis.__CF_STUB__ = { sockets: [], policy: () => "hang", reset() {} };
+      setPolicy(() => "hang");
       const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "100000" } });
       await server.fromClient(connectFrame(7, "slow.example", 443));
       await server.fromClient(frame(7, T.DATA, "early-1"));
@@ -172,11 +172,7 @@ for (const [label, worker] of VARIANTS) {
     });
 
     test("连接超时会回收 socket 并转试下一个出口", async () => {
-      globalThis.__CF_STUB__ = {
-        sockets: [],
-        reset() {},
-        policy: (opts) => (opts.hostname === "direct.example" ? "hang" : "open"),
-      };
+      setPolicy((opts) => (opts.hostname === "direct.example" ? "hang" : "open"));
       const { server } = await openSession(worker, {
         envVars: { CONNECT_TIMEOUT: "100", FALLBACK_IPS: "backup.example" },
       });
@@ -211,14 +207,14 @@ for (const [label, worker] of VARIANTS) {
     });
 
     test("全部出口失败时向客户端回 CLOSE（快速失败，不等客户端超时）", async () => {
-      globalThis.__CF_STUB__ = { sockets: [], reset() {}, policy: () => "reject" };
+      setPolicy(() => "reject");
       const { server } = await openSession(worker, { envVars: { FALLBACK_IPS: "b1.example,b2.example" } });
       await server.fromClient(connectFrame(5, "nope.example", 443));
       await waitFor(() => server.typesOf(5).includes(T.CLOSE), { label: "失败后 CLOSE" });
       assert.equal(sockets().length, 3, "直连 + 2 个静态回退各试一次");
       assert.ok(sockets().every((s) => s.closed), "被拒的 socket 也要回收");
       // 失败后同一会话的其他流仍可用
-      globalThis.__CF_STUB__.policy = () => "open";
+      setPolicy(() => "open");
       await server.fromClient(connectFrame(6, "ok.example", 443));
       await waitFor(() => server.typesOf(6).includes(T.CONNECTED), { label: "后续流可用" });
     });
@@ -266,11 +262,7 @@ for (const [label, worker] of VARIANTS) {
     });
 
     test("?fallbackip= 逐个尝试并去重", async () => {
-      globalThis.__CF_STUB__ = {
-        sockets: [],
-        reset() {},
-        policy: (opts) => (opts.hostname === "dup.example" ? "open" : "reject"),
-      };
+      setPolicy((opts) => (opts.hostname === "dup.example" ? "open" : "reject"));
       const { server } = await openSession(worker, {
         query: "?fallbackip=bad.example,dup.example&fallbackip=DUP.example",
       });
@@ -299,7 +291,7 @@ for (const [label, worker] of VARIANTS) {
         }),
       });
       try {
-        globalThis.__CF_STUB__ = { sockets: [], reset() {}, policy: () => "reject" };
+        setPolicy(() => "reject");
         const { server } = await openSession(worker, {
           envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" },
         });
@@ -321,11 +313,7 @@ for (const [label, worker] of VARIANTS) {
         throw new Error("network down");
       };
       try {
-        globalThis.__CF_STUB__ = {
-          sockets: [],
-          reset() {},
-          policy: (opts) => (opts.hostname === "static.example" ? "open" : "reject"),
-        };
+        setPolicy((opts) => (opts.hostname === "static.example" ? "open" : "reject"));
         const { server } = await openSession(worker, {
           envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api", FALLBACK_IPS: "static.example" },
         });
