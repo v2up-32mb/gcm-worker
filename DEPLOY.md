@@ -1,7 +1,10 @@
 # GCM Worker 服务端部署
 
 Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用中继）。
-仓库只携带 `worker.js` 一个文件——部署配置（域名、账号）留在你自己的环境里。
+仓库只携带 `worker.js` 一个文件——部署配置（域名、账号、`wrangler.toml`）留在你自己的环境里。
+
+- 协议规范：[`gcm` 库仓](https://github.com/v2up-32mb/gcm) `protocol/message.go`（权威定义）
+- 客户端：[`gcm-cli`](https://github.com/v2up-32mb/gcm-cli) / [`x-client`](https://github.com/v2up-32mb/x-client)（Android）
 
 ## 方式一：Dashboard 粘贴（最快）
 
@@ -12,12 +15,14 @@ Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用�
 
 ## 方式二：Wrangler
 
-自建 `wrangler.toml`（`main = "worker.js"`），变量放 `[vars]`，然后：
+自建 `wrangler.toml`（复制模板 `cp wrangler.toml.example wrangler.toml`，改 `name` 与 `[vars]`）：
 
 ```bash
-npm install -g wrangler
-wrangler deploy
+npx wrangler deploy        # 或全局安装：npm install -g wrangler && wrangler deploy
+npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 ```
+
+`wrangler.toml` 已被 `.gitignore` 排除（账号/域名/鉴权值不入库）。
 
 ## 环境变量
 

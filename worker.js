@@ -20,6 +20,9 @@
  * 出口顺序: 直连原始 host > 客户端 ?fallbackip= > 动态节点 API（env.DYNAMIC_NODES_URL）> 静态 fallback（env.FALLBACK_IPS，
  *   每项支持 host 或 host:port；无硬编码默认值）
  *
+ * 仓库: https://github.com/v2up-32mb/gcm-worker
+ *   协议规范（消息类型/头长度）以 gcm 库仓 protocol/message.go 为准，改动前先看 AGENTS.md
+ *
  * 部署说明:
  * 1. 登录 Cloudflare Dashboard
  * 2. 进入 Workers & Pages

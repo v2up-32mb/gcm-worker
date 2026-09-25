@@ -1,0 +1,23 @@
+name: test
+
+on: [push, pull_request]
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      # Worker 主脚本语法（Dashboard 粘贴部署路径要求单文件可直接解析）
+      - name: Syntax check
+        run: npm run check:syntax
+
+      # 跨仓协议一致性：检出 gcm 库仓后比对 MSG_TYPE / HEADER_LEN
+      - name: Cross-repo protocol check
+        run: |
+          git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm
+          npm run check:protocol

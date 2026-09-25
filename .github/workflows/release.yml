@@ -1,0 +1,97 @@
+name: Release
+
+# tag 触发：从 tag 检出，校验并把 Worker 服务端产物随 release 发布
+# workflow_dispatch：可为已存在的 tag 补发 release（tag_name 输入）
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: '为已存在的 tag 补发 release（如 v0.1.0）；留空则使用当前分支代码'
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Resolve ref
+        id: ref
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" && -n "${{ inputs.tag_name }}" ]]; then
+            echo "checkout_ref=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ inputs.tag_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "checkout_ref=${{ github.ref }}" >> $GITHUB_OUTPUT
+            echo "tag_name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ (github.event_name == 'workflow_dispatch' && github.ref) || steps.ref.outputs.checkout_ref }}
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Check (syntax + protocol)
+        run: |
+          git clone --depth 1 https://github.com/v2up-32mb/gcm.git ../gcm || true
+          npm run check
+
+      - name: Package worker
+        run: |
+          mkdir -p dist
+          cp worker.js dist/worker.js
+          cp DEPLOY.md dist/DEPLOY.md
+          node --check dist/worker.js
+          ls -la dist
+
+      - name: Detect prerelease
+        run: |
+          if echo "${{ steps.ref.outputs.tag_name }}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+-'; then
+            echo "IS_PRERELEASE=true" >> $GITHUB_ENV
+          else
+            echo "IS_PRERELEASE=false" >> $GITHUB_ENV
+          fi
+
+      - name: Generate release notes
+        run: |
+          {
+            echo "## GCM Worker 服务端"
+            echo ""
+            echo "| 文件 | 说明 |"
+            echo "|---|---|"
+            echo "| \`worker.js\` | Cloudflare Worker 主脚本（单文件自包含，\`node --check\` 与跨仓协议一致性已校验） |"
+            echo "| \`DEPLOY.md\` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |"
+            echo ""
+            echo "部署配置（\`wrangler.toml\`、域名与账号）不随发布提供，复制 \`wrangler.toml.example\` 自行准备。"
+            echo ""
+            echo "部署：\`wrangler deploy\`（详见 \`DEPLOY.md\`）。"
+            echo ""
+            echo "客户端侧："
+            echo "- gcm-cli：\`gcm --worker <domain> --user-id <USER_ID> --relay <prefIP:port> --proxy-ip <fip>\`"
+            echo "- x-client（Android）：Profile 的 WorkerHost / UserID 字段"
+            echo ""
+            echo "协议规范以 [gcm 库仓](https://github.com/v2up-32mb/gcm) \`protocol/message.go\` 为准。"
+          } > release-notes.md
+          cat release-notes.md
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v1
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        with:
+          tag_name: ${{ steps.ref.outputs.tag_name }}
+          name: "GCM Worker ${{ steps.ref.outputs.tag_name }}"
+          body_path: release-notes.md
+          draft: false
+          prerelease: ${{ env.IS_PRERELEASE }}
+          files: |
+            dist/worker.js
+            dist/DEPLOY.md

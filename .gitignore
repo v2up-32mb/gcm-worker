@@ -1,0 +1,10 @@
+# Wrangler 本地配置与产物（含账号/域名/[vars] 鉴权值，绝不入库）
+wrangler.toml
+.wrangler/
+
+# 依赖
+node_modules/
+
+# 日志与临时文件
+*.log
+.pi/

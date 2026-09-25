@@ -1,0 +1,38 @@
+# Wrangler 配置模板 —— 复制为 wrangler.toml 后按需修改（真实配置不入库，见 .gitignore）
+#
+#   cp wrangler.toml.example wrangler.toml
+#   npx wrangler deploy
+#
+# 鉴权：Cloudflare API Token（建议用环境变量注入，勿写进本文件）
+#   export CLOUDFLARE_API_TOKEN=...
+
+name = "gcm-worker"          # 部署后域名：<name>.<account>.workers.dev
+main = "worker.js"
+compatibility_date = "2025-01-01"
+
+[observability]
+enabled = true
+
+[vars]
+# 必填：URL 路径 /<USER_ID>（小写匹配），客户端 --user-id 需一致；留弱保护默认值
+USER_ID = "change-me"
+
+# 静态出口回退，逗号分隔，每项 host 或 host:port
+FALLBACK_IPS = ""
+
+# 动态出口节点池 API（返回 JSON 列表）
+DYNAMIC_NODES_URL = ""
+ENABLE_DYNAMIC_NODES = "true"
+DYNAMIC_NODES_TIMEOUT = "3000"
+
+# 出口连接超时（毫秒）
+CONNECT_TIMEOUT = "1000"
+
+# 单 WebSocket 连接最大流数
+MAX_STREAMS_PER_CONNECTION = "16"
+
+# 是否启用静态回退 / 调试日志
+ENABLE_FALLBACK = "true"
+ENABLE_LOGGING = "false"
+
+# 完整说明见 DEPLOY.md
