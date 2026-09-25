@@ -129,27 +129,37 @@ function logError(scope, message) {
 }
 
 // 解析地址 (Host:Port)
-function parseAddress(addr) {
-  // 处理 IPv6 格式 [::1]:80
-  if (addr[0] === "[") {
-    const end = addr.indexOf("]");
-    return {
-      host: addr.substring(1, end),
-      port: parseInt(addr.substring(end + 2), 10),
-    };
-  }
-  // 处理 IPv4 或 域名 host:80
-  const sep = addr.lastIndexOf(":");
-  return {
-    host: addr.substring(0, sep),
-    port: parseInt(addr.substring(sep + 1), 10),
-  };
+// 拼装 {host, port}：host 非空、port 为 1..65535 的十进制整数，否则返回 null
+function withPort(host, portText) {
+  const h = String(host || "").trim();
+  if (!h || !/^\d+$/.test(portText)) return null;
+  const port = parseInt(portText, 10);
+  return port >= 1 && port <= 65535 ? { host: h, port } : null;
 }
 
-// 解析 fallback 条目，支持 `host`、`host:port`、`[ipv6]`、`[ipv6]:port`
+// 解析 CONNECT 负载里的目标地址：host:port 或 [ipv6]:port
+// 客户端（gcm StreamDialer）先 net.SplitHostPort 再拼 "host:port|"，故收到的是无方括号形态，
+// 裸 IPv6 靠 lastIndexOf 取到端口
+// 非法地址（空 host / 端口非数字或越界）返回 null，由调用方关流
+function parseAddress(addr) {
+  const s = String(addr || "").trim();
+  if (!s) return null;
+  if (s[0] === "[") {
+    const end = s.indexOf("]");
+    if (end === -1) return null;
+    const rest = s.substring(end + 1);
+    if (rest && rest[0] !== ":") return null;
+    return withPort(s.substring(1, end), rest ? rest.substring(1) : "");
+  }
+  const sep = s.lastIndexOf(":");
+  return sep === -1 ? null : withPort(s.substring(0, sep), s.substring(sep + 1));
+}
+
+// 解析 fallback 条目，支持 `host`、`host:port`、`[ipv6]`、`[ipv6]:port`、裸 IPv6（如 `2606:4700::1`）
 // 不带端口时继承目标端口（保持旧行为）
 function parseFallbackEntry(entry, defaultPort) {
   const s = String(entry || "").trim();
+  if (!s) return null;
   // [ipv6] 或 [ipv6]:port
   if (s[0] === "[") {
     const end = s.indexOf("]");
@@ -159,24 +169,14 @@ function parseFallbackEntry(entry, defaultPort) {
     const rest = s.substring(end + 1);
     if (!rest) return { host, port: defaultPort };
     if (rest[0] !== ":") return null;
-    const port = parseInt(rest.substring(1), 10);
-    if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) return null;
-    return { host, port };
+    return withPort(host, rest.substring(1));
   }
-  // host / host:port（IPv6 裸地址必须加方括号，否则冒号无法区分端口）
+  // 无冒号：纯 host，继承端口
   const sep = s.lastIndexOf(":");
-  if (sep === -1) {
-    if (!s) return null;
-    return { host: s, port: defaultPort };
-  }
-  const port = parseInt(s.substring(sep + 1), 10);
-  if (!Number.isSafeInteger(port) || port <= 0 || port > 65535) {
-    // 冒号后缀不是合法端口：视为非法条目，跳过（避免把裸 IPv6 误解析）
-    return null;
-  }
-  const host = s.substring(0, sep);
-  if (!host) return null;
-  return { host, port };
+  if (sep === -1) return { host: s, port: defaultPort };
+  // 端口前的主机名不含冒号时，尾段才是端口（host:port）；否则整串是裸 IPv6，同样继承端口
+  if (s.substring(0, sep).includes(":")) return { host: s, port: defaultPort };
+  return withPort(s.substring(0, sep), s.substring(sep + 1));
 }
 
 // ==================== 动态兜底节点 ====================
@@ -345,7 +345,14 @@ class StreamManager {
     });
     this.streamCount++;
 
-    let { host, port } = parseAddress(targetAddr);
+    const target = parseAddress(targetAddr);
+    if (!target) {
+      // 目标地址非法：没有可试的出口，直接关流（不再无谓遍历回退列表）
+      this.log(`[${streamId}] 目标地址不可解析: ${targetAddr}`);
+      this.closeStream(streamId);
+      return false;
+    }
+    const { host, port } = target;
     // 出口顺序：直连 > 客户端传入 fallback > 动态节点 > 静态 fallback
     // 1. 直连优先
     {
@@ -770,7 +777,9 @@ async function handleSession(webSocket, config) {
         // CONNECT 消息: [STREAM_ID:1][TYPE:1]{host:port}|
         // 提取目标地址
         const payload = decoder.decode(uint8Array.slice(HEADER_LEN));
-        const targetAddr = payload.substring(0, payload.lastIndexOf("|"));
+        // 负载是 "host:port|"；缺尾杠时按整串解析（容忍非本仓客户端的轻微差异）
+        const bar = payload.lastIndexOf("|");
+        const targetAddr = bar >= 0 ? payload.substring(0, bar) : payload;
         streamManager.log(`[${streamId.toString(16)}] 连接请求: ${targetAddr}`);
         await streamManager.createStream(streamId, targetAddr);
       } else if (msgType === MSG_TYPE.DATA) {

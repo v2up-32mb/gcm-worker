@@ -32,9 +32,20 @@ async function loadInternals() {
 const internals = await loadInternals();
 
 describe("纯函数", () => {
-  test("parseAddress 解析 host:port 与 [ipv6]:port", () => {
-    assert.deepEqual(internals.parseAddress("example.com:443"), { host: "example.com", port: 443 });
-    assert.deepEqual(internals.parseAddress("[2606:4700::1]:443"), { host: "2606:4700::1", port: 443 });
+  test("parseAddress 解析 host:port 与 [ipv6]:port，非法地址返回 null", () => {
+    const p = internals.parseAddress;
+    assert.deepEqual(p("example.com:443"), { host: "example.com", port: 443 });
+    assert.deepEqual(p("[2606:4700::1]:443"), { host: "2606:4700::1", port: 443 });
+    // gcm 客户端发的是无方括号形态（net.SplitHostPort 后拼接）
+    assert.deepEqual(p("2606:4700::1:443"), { host: "2606:4700::1", port: 443 });
+    assert.equal(p("example.com"), null, "缺端口应判非法");
+    assert.equal(p("example.com:0"), null);
+    assert.equal(p("example.com:70000"), null);
+    assert.equal(p("example.com:https"), null);
+    assert.equal(p(":443"), null, "空 host 应判非法");
+    assert.equal(p(""), null);
+    assert.equal(p("[2606:4700::1]"), null, "方括号 IPv6 缺端口应判非法");
+    assert.equal(p("[2606:4700::1]443"), null);
   });
 
   test("parseFallbackEntry 覆盖 host / host:port / [ipv6] / [ipv6]:port / 非法项", () => {
@@ -47,6 +58,11 @@ describe("纯函数", () => {
     assert.equal(p("1.2.3.4:notaport", 8080), null, "非数字端口应判非法而非回退默认端口");
     assert.equal(p("1.2.3.4:0", 8080), null, "端口 0 非法");
     assert.equal(p("1.2.3.4:70000", 8080), null, "端口越界非法");
+    // 裸 IPv6（无方括号）此前会被 lastIndexOf 误拆成 host=":" port=1，现按裸 IPv6 处理并继承端口
+    assert.deepEqual(p("::1", 8080), { host: "::1", port: 8080 });
+    assert.deepEqual(p("2606:4700::1", 8080), { host: "2606:4700::1", port: 8080 });
+    assert.deepEqual(p("[2606:4700::1]", 8080), { host: "2606:4700::1", port: 8080 });
+    assert.equal(p("example.com:notaport", 8080), null, "域名+非数字端口应判非法");
   });
 
   test("normalizeNodeEntry 给裸 IPv6 加方括号、校验端口", () => {
@@ -173,6 +189,25 @@ for (const [label, worker] of VARIANTS) {
       assert.equal(list[0].closed, true, "超时的 socket 必须被 close 回收（回归：曾泄漏到 isolate 结束）");
       assert.equal(list[1].opts.hostname, "backup.example");
       assert.equal(list[1].closed, false);
+    });
+
+    test("目标地址非法时关流且不发起任何连接", async () => {
+      const { server } = await openSession(worker, { envVars: { FALLBACK_IPS: "b1.example,b2.example" } });
+      await server.fromClient(frame(1, T.CONNECT, "example.com:notaport|"));
+      await server.fromClient(frame(1, T.CONNECT, "|"));
+      await server.fromClient(frame(1, T.CONNECT, "example.com:70000|"));
+      await new Promise((r) => setTimeout(r, 50));
+      assert.equal(sockets().length, 0, "非法目标不应触发任何 connect（回归：曾带 NaN 端口跑遍回退列表）");
+      // 后续合法流仍可用，说明只是关流而非拆会话
+      await server.fromClient(connectFrame(1, "ok.example", 443));
+      await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: "合法流仍可用" });
+    });
+
+    test("CONNECT 负载缺尾杠 | 时按整串解析（容忍非本仓客户端）", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(frame(4, T.CONNECT, "example.com:443"));
+      await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "CONNECTED" });
+      assert.deepEqual(sockets()[0].opts, { hostname: "example.com", port: 443 });
     });
 
     test("重复 CONNECT 同一 streamId 会关旧流重建", async () => {
