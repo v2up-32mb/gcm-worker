@@ -126,14 +126,20 @@ const FAKE_PAGE_HTML = `<!DOCTYPE html>
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
 
+// 客户端可控内容（CONNECT 负载、?fallbackip 条目）会进日志行，
+// 去掉控制字符并截断，避免伪造日志行/污染终端
+function cleanLog(s) {
+  return String(s).replace(/[\x00-\x1f\x7f]/g, " ").slice(0, 200);
+}
+
 function log(scope, message, enableLogging = false) {
   if (enableLogging) {
-    console.log(`[${scope}] ${message}`);
+    console.log(`[${scope}] ${cleanLog(message)}`);
   }
 }
 
 function logError(scope, message) {
-  console.error(`[${scope}] ${message}`);
+  console.error(`[${scope}] ${cleanLog(message)}`);
 }
 
 // 解析地址 (Host:Port)
@@ -188,9 +194,11 @@ function parseFallbackEntry(entry, defaultPort) {
 }
 
 // ==================== 动态兜底节点 ====================
-// Workers isolate 生命周期短，不做 TTL 缓存：每次用到都现拉 API。
+// Workers isolate 生命周期短，成功结果不做 TTL 缓存：每次用到都现拉 API。
 // 仅保留单飞（并发流共用一次请求）+ 失败时复用上次结果的 stale 降级。
-let dynamicNodesCache = { entries: [], inflight: null };
+// 失败加一个短负缓存窗口（复用 dynamicNodesTimeout）：否则 API 挂掉时每条流都要
+// 空等满 DYNAMIC_NODES_TIMEOUT 才拨静态回退，还会对故障 API 反复发 subrequest。
+let dynamicNodesCache = { entries: [], inflight: null, failedAt: 0 };
 
 function normalizeNodeEntry(host, port) {
   let h = String(host ?? "").trim();
@@ -241,6 +249,11 @@ async function fetchDynamicNodes(config) {
 async function getDynamicFallbacks(config) {
   if (config.enableDynamicNodes === false) return [];
   if (!(config.dynamicNodesUrl || "").trim()) return [];
+  // 失败负缓存窗口内直接复用 stale（无 stale 即空），不再等一次满超时
+  const cooldown = (config.dynamicNodesTimeout || 3000) / 2;
+  if (dynamicNodesCache.failedAt && Date.now() - dynamicNodesCache.failedAt < cooldown) {
+    return dynamicNodesCache.entries;
+  }
   // 无 TTL：每次现拉，仅单飞合并并发请求
   if (dynamicNodesCache.inflight) {
     try {
@@ -253,11 +266,13 @@ async function getDynamicFallbacks(config) {
     .then((entries) => {
       dynamicNodesCache.entries = entries;
       dynamicNodesCache.inflight = null;
+      dynamicNodesCache.failedAt = 0;
       return entries;
     })
     .catch((err) => {
-      console.error(`[DynamicNodes] 拉取失败: ${err.message}`);
+      logError("DynamicNodes", `拉取失败: ${err.message}`);
       dynamicNodesCache.inflight = null;
+      dynamicNodesCache.failedAt = Date.now();
       return dynamicNodesCache.entries; // 有 stale 用 stale，全新失败则为 []
     });
   dynamicNodesCache.inflight = p;
@@ -553,34 +568,34 @@ class StreamManager {
     }
 
 
-    // TCP 尚未连上时缓存数据，等连接成功后 flush；
-    // 预连接窗口最长可达 N×CONNECT_TIMEOUT，客户端可借此无限灌数据撑爆 isolate 内存，
-    // 故累计字节超限即快速失败（回 CLOSE 让客户端立即感知）
+    const chunk = data instanceof Uint8Array ? data : encoder.encode(data);
+    // 未连通：缓存待 flush；已连通：在途未确认写出。两者都计入 pendingBytes 并受
+    // maxPendingBytes 约束——message 监听器不会被运行时 await，目标慢读/黑洞时
+    // 写出队列只增不减，没有这道闸就会线性撑爆 isolate 内存
+    const cost = chunk.length + PENDING_FRAME_OVERHEAD;
+    stream.pendingBytes += cost;
+    if (stream.pendingBytes > this.config.maxPendingBytes) {
+      this.log(`[${streamId}] 缓冲/在途字节超过上限 ${this.config.maxPendingBytes}B，关流`);
+      this.sendCloseFor(stream);
+      this.closeStreamObject(stream);
+      return false;
+    }
+
     if (!stream.tcpConnected) {
-      const bufData = data instanceof Uint8Array ? data : encoder.encode(data);
-      stream.pendingBytes += bufData.length + PENDING_FRAME_OVERHEAD;
-      if (stream.pendingBytes > this.config.maxPendingBytes) {
-        this.log(`[${streamId}] 早期数据超过上限 ${this.config.maxPendingBytes}B，关流`);
-        this.sendCloseFor(stream);
-        this.closeStreamObject(stream);
-        return false;
-      }
-      stream.pendingBuffer.push(bufData);
+      stream.pendingBuffer.push(chunk);
       return true;
     }
 
     try {
-      if (data instanceof Uint8Array) {
-        await stream.remoteWriter.write(data);
-      } else {
-        await stream.remoteWriter.write(encoder.encode(data));
-      }
+      await stream.remoteWriter.write(chunk);
       return true;
     } catch (e) {
       this.log(`[${streamId}] 写入失败: ${e.message}`);
       this.sendCloseFor(stream);
       this.closeStreamObject(stream);
       return false;
+    } finally {
+      stream.pendingBytes -= cost;
     }
   }
 
@@ -879,6 +894,10 @@ async function handleSession(webSocket, config) {
       } else if (msgType === MSG_TYPE.CLOSE) {
         // CLOSE 消息: [STREAM_ID:1][TYPE:1]
         streamManager.log(`[${streamId.toString(16)}] 关闭流`);
+        // 客户端主动关闭：标记已通知，抑制 pump 收尾的回帧（否则杂散 CLOSE 可能落在
+        // 客户端「已注册 handler、还没收到 CONNECTED」的同 id 复用窗口里，把新流打断）
+        const closing = streamManager.getStream(streamId);
+        if (closing) closing.closeNotified = true;
         streamManager.closeStream(streamId);
       } else {
         logError("Mux", `未知消息类型: ${msgType}`);

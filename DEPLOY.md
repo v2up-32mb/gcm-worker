@@ -31,11 +31,11 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 | `USER_ID` | 用户鉴权 ID（URL 路径 `/USER_ID`，**大小写不敏感**匹配；客户端 `--user-id` / `user_id` 需一致） |
 | `FALLBACK_IPS` | 静态出口回退代理，逗号分隔（每项 host 或 host:port） |
 | `ENABLE_FALLBACK` | 是否启用静态回退（`true`/`false`） |
-| `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表） |
+| `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表）；拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的负缓存窗口，窗口内复用 stale（无则为空）不再外呼 |
 | `ENABLE_DYNAMIC_NODES` / `DYNAMIC_NODES_TIMEOUT` | 动态节点开关与超时（毫秒） |
 | `CONNECT_TIMEOUT` | 出口连接超时（毫秒） |
 | `MAX_STREAMS_PER_CONNECTION` | 单 WebSocket 连接最大流数 |
-| `MAX_PENDING_BYTES` | 预连接窗口内每条流缓存的早期数据上限（字节，默认 `1048576`，范围 16KiB–8MiB），超限回 CLOSE |
+| `MAX_PENDING_BYTES` | 每条流的在途字节上限（字节，默认 `1048576`，范围 16KiB–8MiB）：预连接期未 flush 的早期数据 + 已连接期未确认写出的 DATA 合计，超限回 CLOSE |
 | `MAX_FALLBACK_IPS` | `?fallbackip=` 条数上限（默认 `16`，范围 1–64），超出部分忽略 |
 | `ENABLE_LOGGING` | 调试日志开关 |
 

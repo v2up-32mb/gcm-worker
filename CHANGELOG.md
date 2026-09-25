@@ -23,6 +23,18 @@
   现每帧额外计入对象开销；超限回 CLOSE + 关流。
 - **非二进制消息不再拆会话**：WebSocket 文本帧此前会让 `decoder.decode(string)` 抛 TypeError，
   经 catch 把整条会话（含其它流）一起关掉；现按协议只接受二进制帧，文本帧记日志后忽略。
+- **在途写出有上限**：此前 `MAX_PENDING_BYTES` 只管预连接窗口，已连接后直接
+  `await remoteWriter.write(data)` 且无计量——目标慢读/黑洞时写出队列只增不减
+  （message 监听器不会被运行时 await），可线性撑爆 isolate 内存。现在两阶段共用
+  `pendingBytes` 计量，超限回 CLOSE + 关流。
+- **客户端主动 CLOSE 不再回帧**：`sendCloseFor` 缺「关闭发起方」概念，客户端已关闭的流
+  仍会被 pump 收尾补发一帧 CLOSE；该杂散帧可能落在客户端「已注册 handler、尚未收到
+  CONNECTED」的同 id 复用窗口里，把刚发起的建流打断。现由客户端 CLOSE 分支标记已通知。
+- **动态节点失败负缓存**：拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的窗口，窗口内直接复用
+  stale（无 stale 即空），不再每条流空等满 `DYNAMIC_NODES_TIMEOUT` 才拨静态回退、
+  也不对故障 API 反复发 subrequest。
+- **日志净化**：客户端可控内容（CONNECT 负载、`?fallbackip=` 条目）原样进日志行，
+  可注入换行/ANSI 伪造运维记录；现统一在 `log`/`logError` 内剥控制字符并截断到 200 字符。
 - **USER_ID 大小写不敏感**：此前只把 `env.USER_ID` 小写化，客户端把 `--user-id` 原样放进路径，
   含大写字母的 ID 即便两端配置一致也永远 403，且无任何日志。
 

@@ -25,7 +25,7 @@ async function loadInternals() {
     .replace(/^import[\s\S]*?;$/m, "")
     .replace(/export default \{[\s\S]*?\n\};/, ""); // 去掉 fetch 入口
   const fn = new Function(
-    `${body}\nreturn { parseAddress, parseFallbackEntry, normalizeNodeEntry, buildConfigFromEnv, parseEnvBool, parseEnvInt };`,
+    `${body}\nreturn { parseAddress, parseFallbackEntry, normalizeNodeEntry, buildConfigFromEnv, parseEnvBool, parseEnvInt, cleanLog };`,
   );
   return fn();
 }
@@ -564,6 +564,71 @@ for (const [label, worker] of VARIANTS) {
     test("USER_ID 含大写：客户端原样传 /AbC 也应握手成功", async () => {
       const { res } = await openSession(worker, { envVars: { USER_ID: "AbCdEf" }, path: "/AbCdEf" });
       assert.equal(res.status, 101, "混合大小写 USER_ID 不得永远 403（回归）");
+    });
+
+    test("在途未确认写出超上限：回 CLOSE 并关流（回归：慢目标时写出队列无界）", async () => {
+      // 目标永不读：写全部挂起
+      const gates = [];
+      setWriteHook(() => new Promise((res) => gates.push(res)));
+      try {
+        const { server } = await openSession(worker, { envVars: { MAX_PENDING_BYTES: "16384" } });
+        await server.fromClient(connectFrame(4, "a.example", 443));
+        await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "CONNECTED" });
+        for (let i = 0; i < 200; i++) {
+          await server.fromClient(frame(4, T.DATA, new Uint8Array(1024))); // 每帧计入 1024+32
+        }
+        await waitFor(() => server.typesOf(4).includes(T.CLOSE), { label: "在途超限 CLOSE" });
+        assert.equal(sockets()[0].closed, true, "socket 应被回收");
+      } finally {
+        setWriteHook(null);
+      }
+    });
+
+    test("客户端主动 CLOSE 后服务端不回帧（回归：杂散 CLOSE 打断同 id 复用）", async () => {
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(4, "a.example", 443));
+      await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "CONNECTED" });
+      const before = server.typesOf(4).length;
+      await server.fromClient(frame(4, T.CLOSE));
+      await new Promise((r) => setTimeout(r, 30));
+      assert.deepEqual(server.typesOf(4).slice(before), [], `客户端已关流，服务端不应再回帧（实际 ${JSON.stringify(server.typesOf(4).slice(before))}）`);
+      assert.equal(sockets()[0].closed, true);
+    });
+
+    test("日志净化：客户端可控内容里的控制字符被替换", async () => {
+      const { cleanLog } = await loadInternals();
+      assert.equal(cleanLog("a\nb"), "a b");
+      const esc = String.fromCharCode(27);
+      assert.equal(cleanLog(`[Mux] ${esc}[31m伪造`), "[Mux]  [31m伪造");
+      assert.equal(cleanLog("x".repeat(500)).length, 200, "超长内容应被截断");
+    });
+
+    test("动态节点拉取失败：负缓存窗口内不再重复外呼（回归：每条流空等一次超时）", async () => {
+      let calls = 0;
+      const realFetch = globalThis.fetch;
+      globalThis.fetch = async () => {
+        calls++;
+        throw new Error("network down");
+      };
+      try {
+        setPolicy(() => "reject");
+        const w = await freshWorker(worker === workers.min ? "min" : "dev");
+        let s = await openSession(w, { envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" } });
+        await s.server.fromClient(connectFrame(1, "a.example", 443));
+        await waitFor(() => s.server.typesOf(1).includes(T.CLOSE), { label: "首条流结束" });
+        s.server.close();
+        resetStub();
+        assert.equal(calls, 1, "首次拉取应发生一次");
+
+        // 第二条流：仍在负缓存窗口内，不应再外呼
+        setPolicy(() => "reject");
+        s = await openSession(w, { envVars: { DYNAMIC_NODES_URL: "https://nodes.example/api" } });
+        await s.server.fromClient(connectFrame(2, "b.example", 443));
+        await waitFor(() => s.server.typesOf(2).includes(T.CLOSE), { label: "第二条流结束" });
+        assert.equal(calls, 1, `负缓存窗口内不应重复外呼，实际外呼 ${calls} 次`);
+      } finally {
+        globalThis.fetch = realFetch;
+      }
     });
 
     test("?fallbackip= 逐个尝试并去重", async () => {
