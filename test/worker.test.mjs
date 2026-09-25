@@ -260,6 +260,72 @@ for (const [label, worker] of VARIANTS) {
       await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: "非法目标 CLOSE" });
     });
 
+    test("flush 期间流被换掉：旧代不再发 CONNECTED（回归：flush 窗口的双 CONNECTED）", async () => {
+      // 把写挂起，模拟"早期负载已下到 TCP 缓冲、write 正在结算"的窗口。
+      // 真实运行时 socket 被 close 后在途 write 可能仍兑现，故替身不复现在途写失败。
+      const gates = [];
+      setWriteHook(() => new Promise((res) => gates.push(res)));
+      try {
+        setPolicy((opts) => (opts.hostname === "slow.example" ? "hang" : "open"));
+        const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "30000" } });
+        await server.fromClient(connectFrame(7, "slow.example", 443));
+        await server.fromClient(frame(7, T.DATA, "early"));
+        const sockA = sockets()[0];
+        sockA.resolveOpened();
+        await waitFor(() => gates.length >= 1, { label: "旧代 flush 写入挂起" });
+
+        // 窗口内：同一 streamId 重发 CONNECT → 旧代被换掉
+        await server.fromClient(connectFrame(7, "fast.example", 443));
+        await waitFor(() => server.typesOf(7).filter((t) => t === T.CONNECTED).length === 1, { label: "新代 CONNECTED" });
+
+        gates.forEach((g) => g()); // 放行旧代 flush
+        await new Promise((r) => setTimeout(r, 30));
+
+        assert.equal(sockA.closed, true, "旧代 socket 应被回收");
+        assert.equal(
+          server.typesOf(7).filter((t) => t === T.CONNECTED).length,
+          1,
+          "旧代不得在 flush 之后补发第二帧 CONNECTED",
+        );
+      } finally {
+        setWriteHook(null);
+      }
+    });
+
+    test("flush 期间客户端 CLOSE：不再收到 CONNECTED", async () => {
+      const gates = [];
+      setWriteHook(() => new Promise((res) => gates.push(res)));
+      try {
+        setPolicy(() => "hang");
+        const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "30000" } });
+        await server.fromClient(connectFrame(5, "slow.example", 443));
+        await server.fromClient(frame(5, T.DATA, "early"));
+        sockets()[0].resolveOpened();
+        await waitFor(() => gates.length >= 1, { label: "flush 写入挂起" });
+        await server.fromClient(frame(5, T.CLOSE));
+        gates.forEach((g) => g());
+        await new Promise((r) => setTimeout(r, 30));
+        assert.equal(server.typesOf(5).includes(T.CONNECTED), false, `流已被关，不应再收到 CONNECTED（frames: ${JSON.stringify(server.typesOf(5))}）`);
+      } finally {
+        setWriteHook(null);
+      }
+    });
+
+    test("文本（非二进制）WebSocket 消息被忽略，不拆会话", async () => {
+      const { server } = await openSession(worker);
+      // 真实 WebSocket 文本帧的 event.data 是 string
+      server.deliverText("\u0000\u0000hello");
+      await new Promise((r) => setTimeout(r, 20));
+      assert.equal(server.closed, null, "文本帧不得拆掉整条会话");
+      await server.fromClient(connectFrame(1, "a.example", 443));
+      await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: "会话仍可用" });
+    });
+
+    test("USER_ID 大小写：客户端路径与 env 一致即可（大小写不敏感）", async () => {
+      const { res } = await openSession(worker, { envVars: { USER_ID: "AbC" }, path: "/abc" });
+      assert.equal(res.status, 101);
+    });
+
     test("重复 CONNECT 同一 streamId 会关旧流重建", async () => {
       const { server } = await openSession(worker);
       await server.fromClient(connectFrame(9, "a.example", 443));
@@ -483,6 +549,21 @@ for (const [label, worker] of VARIANTS) {
       } finally {
         setWriteHook(null);
       }
+    });
+
+    test("空 DATA 帧不能零成本绕过早期数据上限（回归：payload 0 字节不计费）", async () => {
+      setPolicy(() => "hang");
+      const { server } = await openSession(worker, {
+        envVars: { CONNECT_TIMEOUT: "30000", MAX_PENDING_BYTES: "16384" },
+      });
+      await server.fromClient(connectFrame(4, "slow.example", 443));
+      for (let i = 0; i < 600; i++) await server.fromClient(frame(4, T.DATA)); // 空帧
+      await waitFor(() => server.typesOf(4).includes(T.CLOSE), { label: "空帧超限 CLOSE" });
+    });
+
+    test("USER_ID 含大写：客户端原样传 /AbC 也应握手成功", async () => {
+      const { res } = await openSession(worker, { envVars: { USER_ID: "AbCdEf" }, path: "/AbCdEf" });
+      assert.equal(res.status, 101, "混合大小写 USER_ID 不得永远 403（回归）");
     });
 
     test("?fallbackip= 逐个尝试并去重", async () => {

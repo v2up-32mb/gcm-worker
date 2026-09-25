@@ -28,7 +28,7 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 
 | 变量 | 说明 |
 |---|---|
-| `USER_ID` | 用户鉴权 ID（URL 路径 `/USER_ID` 小写匹配；客户端 `--user-id` / `user_id` 需一致） |
+| `USER_ID` | 用户鉴权 ID（URL 路径 `/USER_ID`，**大小写不敏感**匹配；客户端 `--user-id` / `user_id` 需一致） |
 | `FALLBACK_IPS` | 静态出口回退代理，逗号分隔（每项 host 或 host:port） |
 | `ENABLE_FALLBACK` | 是否启用静态回退（`true`/`false`） |
 | `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表） |

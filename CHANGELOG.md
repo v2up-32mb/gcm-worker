@@ -6,6 +6,47 @@
 
 ## 未发版（main HEAD，待人工批准打 tag）
 
+**Fixed（本轮多身份评审驱动）**
+
+- **流按对象身份绑定**：重复 CONNECT 同一 streamId 时，旧的在途拨号不再把 socket 绑到新一代流上
+  （此前会双发 CONNECTED、先到的 socket 永不回收、两条 pump 向同一 streamId 推数据）。
+  收尾（pump 尾 CLOSE、删表、streamCount）也只作用于自己的流对象，旧代收尾不再误杀同 id 新流。
+- **flush 窗口的身份复查**：早期数据 flush 循环里有 await，期间流可能被关闭或被同 id 新 CONNECT 接管；
+  现在置位 `tcpConnected` / 发 CONNECTED / 起 pump 之前都会复查身份。
+- **建流失败一律回 CLOSE**：写失败、flush 写失败不再依赖 pump 兜底的时序巧合。CLOSE 通知统一收敛到
+  `sendCloseFor`：每条流至多一帧，同 streamId 被新一代接管时不发。
+- **流关闭即停手**：客户端 CLOSE / WS 关闭后，`createStream` 不再把剩余回退出口逐个拨完；
+  在途（尚未就绪）的 socket 立即 close，不占着连接额度等到 `CONNECT_TIMEOUT` 走完。
+- **早期数据字节序**：flush 期间到达的客户端 DATA 不再插到未写完的缓存条目中间
+  （此前目标端可能收到 `early-1, early-3, early-2`，TLS/HTTP 会判协议错误）。
+- **早期数据缓存不可绕过**：空 DATA 帧（payload 0 字节）此前零成本绕过字节上限，
+  现每帧额外计入对象开销；超限回 CLOSE + 关流。
+- **非二进制消息不再拆会话**：WebSocket 文本帧此前会让 `decoder.decode(string)` 抛 TypeError，
+  经 catch 把整条会话（含其它流）一起关掉；现按协议只接受二进制帧，文本帧记日志后忽略。
+- **USER_ID 大小写不敏感**：此前只把 `env.USER_ID` 小写化，客户端把 `--user-id` 原样放进路径，
+  含大写字母的 ID 即便两端配置一致也永远 403，且无任何日志。
+
+**Added**
+
+- `MAX_PENDING_BYTES`（预连接窗口内每条流缓存的早期数据上限，默认 1MiB，16KiB–8MiB）——
+  此前无上限，持有 USER_ID 的客户端可在窗口内无限灌数据撑爆 isolate 内存。
+- `MAX_FALLBACK_IPS`（`?fallbackip=` 条数上限，默认 16，1–64）——此前无上限，
+  一条 CONNECT 就能把拨号链拉到分钟级并占满流槽位。
+
+**Other**
+
+- 测试台对齐 Workers 真实语义：二进制按 ArrayBuffer 投递（覆盖生产唯一分支）、
+  异步 sink（可观察写序竞态）、写/读失败注入、独立模块实例（隔离动态节点 stale 缓存）。
+  45 → 87 条用例，压缩版与可读版跑同一套。
+- 跨列表去重：回退列表里与直连 host:port 相同的条目不再被重复拨一次。
+
+**升级指引**：协议格式与出口优先级未变，客户端无需改动。行为差异（均为修复方向）：
+① 重复 CONNECT 同一 streamId 时，旧的在途拨号被取消，不再发第二个 CONNECTED；
+② 建流失败（含写失败、早期数据超限）一律回 CLOSE，客户端快速失败而非等超时；
+③ 早期数据超 `MAX_PENDING_BYTES`、`?fallbackip=` 超 `MAX_FALLBACK_IPS` 时流/条目被截断；
+④ 文本（非二进制）WebSocket 帧被忽略，不再拆会话；
+⑤ `USER_ID` 现大小写不敏感匹配。
+
 **Fixed**
 
 - 连接超时/被拒时回收已创建的 socket（此前只放弃等待转试下一个出口，迟到的连接会一直挂到

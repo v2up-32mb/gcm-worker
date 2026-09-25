@@ -39,6 +39,10 @@ import { connect } from "cloudflare:sockets";
 const WS_READY_STATE_OPEN = 1;
 const WS_READY_STATE_CLOSING = 2;
 
+// 早期数据缓存里每帧除 payload 外还有 Uint8Array/数组槽开销，按此计费，
+// 否则空帧（payload 0 字节）能零成本绕过 MAX_PENDING_BYTES
+const PENDING_FRAME_OVERHEAD = 32;
+
 // ==================== 默认配置（兜底值；一切配置统一从环境变量读取） ====================
 const DEFAULT_CONFIG = {
   enableFallback: true,
@@ -506,6 +510,15 @@ class StreamManager {
         stream.pendingBuffer = [];
       }
 
+      // flush 循环里有 await，流可能在此期间被客户端关闭、或被同 streamId 的新 CONNECT 接管；
+      // 置位 tcpConnected / 发 CONNECTED / 起 pump 之前必须再确认一次身份，
+      // 否则旧代仍会为已被换掉的 id 发第二帧 CONNECTED（双 CONNECTED 窗口）
+      if (stream.isClosed || this.streams.get(streamId) !== stream) {
+        try { remoteWriter.releaseLock(); } catch {}
+        try { remoteSocket.close(); } catch {}
+        return "aborted";
+      }
+
       // 必须等 flush 结束再置位：flush 期间到达的客户端 DATA 要继续进 pendingBuffer，
       // 否则会插到未写完的缓存条目中间，破坏发往目标的字节序（TLS/HTTP 会被判协议错误）
       stream.tcpConnected = true;
@@ -545,7 +558,7 @@ class StreamManager {
     // 故累计字节超限即快速失败（回 CLOSE 让客户端立即感知）
     if (!stream.tcpConnected) {
       const bufData = data instanceof Uint8Array ? data : encoder.encode(data);
-      stream.pendingBytes += bufData.length;
+      stream.pendingBytes += bufData.length + PENDING_FRAME_OVERHEAD;
       if (stream.pendingBytes > this.config.maxPendingBytes) {
         this.log(`[${streamId}] 早期数据超过上限 ${this.config.maxPendingBytes}B，关流`);
         this.sendCloseFor(stream);
@@ -723,9 +736,12 @@ export default {
       // 如果环境变量未设置，使用默认 UUID 作为路径，相当于一种弱保护或后门
       const userID = (env.USER_ID || "uuid-placeholder").toLowerCase();
       const validPath = `/${userID}`;
+      // 请求侧也按小写比较：客户端把 --user-id 原样放进路径，
+      // 单侧小写会让含大写字母的 USER_ID 即便两端配置一致也永远 403
+      const isValidPath = (p) => p.toLowerCase() === validPath;
 
       // 1. 路由判断: 仅 /USER_ID 处理 WebSocket
-      if (url.pathname === validPath) {
+      if (isValidPath(url.pathname)) {
         const upgradeHeader = request.headers.get("Upgrade");
         if (!upgradeHeader || upgradeHeader.toLowerCase() !== "websocket") {
           return new Response("Expected WebSocket", { status: 426 });
@@ -828,7 +844,12 @@ async function handleSession(webSocket, config) {
     try {
       const data = event.data;
 
-      // 处理二进制数据
+      // 只接受二进制消息：文本帧的 event.data 是 string，交给下游会抛 TypeError
+      // 并把整条会话（含其它流）一起拆掉
+      if (typeof data === "string") {
+        logError("Mux", "忽略非二进制消息（文本帧）");
+        return;
+      }
       const uint8Array =
         data instanceof ArrayBuffer ? new Uint8Array(data) : data;
 
