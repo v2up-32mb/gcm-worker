@@ -8,7 +8,7 @@
     "check": "npm run check:syntax && npm run check:protocol && npm test",
     "check:syntax": "node --check worker.js",
     "check:protocol": "node scripts/check-protocol.mjs",
-    "test": "node --test \"test/*.test.mjs\"",
+    "test": "node --test test/worker.test.mjs",
     "build": "node scripts/build.mjs",
     "size": "node scripts/build.mjs",
     "dev": "wrangler dev",
