@@ -21,7 +21,8 @@ TYPE = 3 CLOSE      无 DATA
 ```
 
 客户端接入：`wss://<worker域名>/<user_id>?fallbackip=<出口IP列表>`
-（`USER_ID` 取环境变量，路径小写匹配；`?fallbackip=` 可重复/逗号分隔，每项 `host` 或 `host:port`）。
+（`USER_ID` 取环境变量，大小写不敏感匹配；`?fallbackip=` 可重复/逗号分隔，每项 `host` 或 `host:port`）。
+`USER_ID` 未配置时 Worker **拒绝一切接入**（fail-closed），没有默认占位路径。
 
 出口顺序：**直连原始 host > 客户端 `?fallbackip=` > 动态节点 API（`DYNAMIC_NODES_URL`）>
 静态 `FALLBACK_IPS`**（后三级在 `ENABLE_FALLBACK=false` 时整体关闭，动态节点另受

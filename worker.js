@@ -6,7 +6,8 @@
  * 功能: 通过 WebSocket 接收 GCM 二进制多路复用代理请求，转发到目标服务器
  *
  * 接入路径: wss://<worker域名>/<USER_ID>?fallbackip=<出口IP列表>
- *   - USER_ID 取 env.USER_ID（小写匹配），不匹配的路径一律拒绝
+ *   - USER_ID 取 env.USER_ID（大小写不敏感匹配），不匹配的路径一律拒绝；
+ *     未配置 USER_ID 时 fail-closed：任何路径都返回 403 伪装页，不存在默认占位路径
  *   - ?fallbackip= 可重复/逗号分隔，每项支持 host 或 host:port，作为客户端侧出口偏好
  *
  * 协议格式 (2字节头: [STREAM_ID:1][TYPE:1]，TYPE 语义见 gcm 库 protocol 包):
@@ -713,9 +714,17 @@ export default {
     try {
       const url = new URL(request.url);
 
-      // 0. 获取认证 ID (优先环境变量，否则使用默认 UUID)
-      // 如果环境变量未设置，使用默认 UUID 作为路径，相当于一种弱保护或后门
-      const userID = (env.USER_ID || "uuid-placeholder").toLowerCase();
+      // 0. 获取认证 ID：缺省即 fail-closed。
+      // 此前退到硬编码公开路径 /uuid-placeholder，等于未鉴权的开放代理（占位串随源码公开）。
+      const rawUserID = String(env.USER_ID ?? "").trim();
+      if (!rawUserID) {
+        logError("Server", "未配置 USER_ID，拒绝一切接入（fail-closed）");
+        return new Response(FAKE_PAGE_HTML, {
+          status: 403,
+          headers: { "Content-Type": "text/html;charset=UTF-8" },
+        });
+      }
+      const userID = rawUserID.toLowerCase();
       const validPath = `/${userID}`;
       // 请求侧也按小写比较：客户端把 --user-id 原样放进路径，
       // 单侧小写会让含大写字母的 USER_ID 即便两端配置一致也永远 403

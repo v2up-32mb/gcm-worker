@@ -818,18 +818,22 @@ for (const [label, worker] of VARIANTS) {
       await waitFor(() => sockets().every((s) => s.closed), { label: "全部 socket 回收" });
     });
 
-    test("缺少 USER_ID 时使用弱保护占位路径", async () => {
-      const request = {
-        url: "https://worker.test/uuid-placeholder",
-        headers: { get: () => "websocket" },
-      };
-      const res = await worker.fetch(request, { CONNECT_TIMEOUT: "1000" });
+    test("未配置 USER_ID：fail-closed，任何路径都拒绝（回归：曾退到公开占位路径）", async () => {
+      for (const envVars of [{}, { USER_ID: "" }, { USER_ID: "   " }, { USER_ID: undefined }]) {
+        for (const path of ["/uuid-placeholder", "/anything", "/"]) {
+          const res = await worker.fetch(
+            { url: `https://worker.test${path}`, headers: { get: () => "websocket" } },
+            { CONNECT_TIMEOUT: "1000", ...envVars },
+          );
+          assert.equal(res.status, 403, `env=${JSON.stringify(envVars)} path=${path} 应拒绝`);
+          assert.match(await res.text(), /not allowed/i);
+        }
+      }
+    });
+
+    test("USER_ID 前后空白被忽略，不影响鉴权", async () => {
+      const { res } = await openSession(worker, { envVars: { USER_ID: "  padded-id  " }, path: "/padded-id" });
       assert.equal(res.status, 101);
-      const bad = await worker.fetch(
-        { url: "https://worker.test/anything", headers: { get: () => "websocket" } },
-        {},
-      );
-      assert.equal(bad.status, 403);
     });
 
     test("异常 env 不致命（fetch 内部抛错返回 500）", async () => {

@@ -20,7 +20,8 @@ Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用�
 
 1. Cloudflare Dashboard → Workers & Pages → Create Worker
 2. 将 `worker.js` 全文粘贴到在线编辑器
-3. 在 Worker 的 **Settings → Variables** 添加环境变量（见下表，至少 `USER_ID`）
+3. 在 Worker 的 **Settings → Variables** 添加环境变量（见下表）。`USER_ID` **必填**：
+   不配置 Worker 会拒绝所有连接（fail-closed），这是有意的安全默认。
 4. 部署并记录 Worker URL（形如 `https://<name>.<account>.workers.dev/<USER_ID>`）
 
 ## 方式二：Wrangler
@@ -38,7 +39,7 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 
 | 变量 | 说明 |
 |---|---|
-| `USER_ID` | 用户鉴权 ID（URL 路径 `/USER_ID`，**大小写不敏感**匹配；客户端 `--user-id` / `user_id` 需一致） |
+| `USER_ID` | **必填**。用户鉴权 ID（URL 路径 `/USER_ID`，**大小写不敏感**匹配；客户端 `--user-id` / `user_id` 需一致）。未配置或为空白时 Worker **拒绝一切接入**（返回 403 伪装页）并在日志记 `未配置 USER_ID`——不存在默认占位路径 |
 | `FALLBACK_IPS` | 静态出口回退代理，逗号分隔（每项 host 或 host:port） |
 | `ENABLE_FALLBACK` | 是否启用**全部回退出口**（`true`/`false`）：`false` 时只剩直连，客户端 `?fallbackip=`、动态节点、静态 `FALLBACK_IPS` 一并失效 |
 | `DYNAMIC_NODES_URL` | 动态出口节点池 API（返回 JSON 列表）；拉取失败后进入 `DYNAMIC_NODES_TIMEOUT/2` 的负缓存窗口，窗口内复用 stale（无则为空）不再外呼。字段格式：`ip`/`host`/`address` 给纯主机或 IP（IPv6 可裸写或写 `[...]`），端口放独立 `port` 字段（`address` 自带 `host:port` 也支持） |

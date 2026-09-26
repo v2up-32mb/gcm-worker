@@ -36,8 +36,9 @@ gcm(Go 核心库: 客户端侧 2 字节头多路复用/连接池/流管理/中�
    压缩版体积受 `scripts/build.mjs` 的预算约束（raw ≤16KiB / gzip ≤6KiB），超限 CI 失败——
    新增功能前先 `npm run size` 看余量。
 4. **秘密与部署配置不入库**：`wrangler.toml`（账号、域名、`[vars]`）留在本地/Cloudflare 侧，
-   仓库只提供 `wrangler.toml.example`。`USER_ID` 等鉴权值绝不入库、绝不打默认值上线
-   （`env.USER_ID` 缺省会退化成弱保护占位路径，README/DEPLOY.md 已注明生产必须设置）。
+   仓库只提供 `wrangler.toml.example`。`USER_ID` 等鉴权值绝不入库。
+   **`USER_ID` 缺省一律 fail-closed**：不配置就拒绝一切接入（403 伪装页）并记日志，
+   不允许再退回任何硬编码占位路径——那等于未鉴权的开放代理。
 5. **配置全部来自环境变量**（`env.*`），无硬编码默认值兜底（无可用值时降级为空并记日志）。
    新增配置项：`buildConfigFromEnv` 里加解析（`parseEnvBool`/`parseEnvInt` 带范围钳制）
    + `DEPLOY.md` 环境变量表补一行 + `CHANGELOG.md` 记一笔。
