@@ -9,8 +9,11 @@
  *   - USER_ID 取 env.USER_ID（大小写不敏感匹配），不匹配的路径一律拒绝；
  *     未配置 USER_ID 时 fail-closed：任何路径都返回 403 伪装页，不存在默认占位路径
  *   - ?fallbackip= 可重复/逗号分隔，每项支持 host 或 host:port，作为客户端侧出口偏好
- *   - ?proxy-all=true 时本连接的所有流**跳过直连**，直接从 ?fallbackip= 起步走回退链
- *     （连接级开关，默认 false；一条回退都拿不到时按全败回 CLOSE 并记 logError）
+ *   - ?proxy-all=true 时本连接的所有流**跳过直连与静态出口链**，改用 **socks5 代理**作为流量出口：
+ *     出口配置取自 ?fallbackip=（此时每项必须是 socks5 配置）与环境变量 SOCKS5_PROXY，
+ *     支持 `[socks5h?://][user:pass@]host[:port]`（缺省端口 1080）。首连失败自动试下一个。
+ *     没有任何 socks5 配置时 fail-close：零拨号直接回 CLOSE 并记 logError。
+ *     注意这是 v0.1.3 起的新语义（见 CHANGELOG）：v0.1.2 的「跳过直连仍走 L4 回退链」已废弃。
  *
  * 协议格式 (2字节头: [STREAM_ID:1][TYPE:1]，TYPE 语义见 gcm 库 protocol 包):
  * - 客户端 -> Worker: TYPE=0 CONNECT，DATA 为 ASCII "host:port|"
@@ -20,13 +23,13 @@
  * - Worker -> 客户端: TYPE=2 DATA，[binary_data]
  * - Worker -> 客户端: TYPE=3 CLOSE
  *
- * 出口顺序: 直连原始 host > 客户端 ?fallbackip= > 动态节点 API（env.DYNAMIC_NODES_URL）> 静态 fallback（env.FALLBACK_IPS，
+ * 出口顺序（非 proxy-all）: 直连原始 host > 客户端 ?fallbackip= > 动态节点 API（env.DYNAMIC_NODES_URL）> 静态 fallback（env.FALLBACK_IPS，
  *   每项支持 host 或 host:port；无硬编码默认值）
  *   注意：ENABLE_FALLBACK=false 会把第 2~4 级（?fallbackip=、动态节点、静态 FALLBACK_IPS）整体关闭，
  *   只剩直连；ENABLE_DYNAMIC_NODES 可单独关闭动态节点这一级。
- *   ?proxy-all=true 则砍掉第 1 级（直连），从第 2 级起步——用于「强制所有流量走指定出口」。
- *   出口条目里的显式端口是 **L4 覆盖**语义：目标端口被该端口替换，节点靠报文（SNI/Host/端口表）
+ *   此路径下出口条目里的显式端口是 **L4 覆盖**语义：目标端口被该端口替换，节点靠报文（SNI/Host/端口表）
  *   自行路由到真实目标——**不是 SOCKS/HTTP 代理，Worker 不做任何握手**。
+ *   proxy-all 模式的出口语义完全不同（走 socks5 代理），见上方 ?proxy-all 条目。
  *
  * 仓库: https://github.com/v2up-32mb/gcm-worker
  *   协议规范（消息类型/头长度）以 gcm 库仓 protocol/message.go 为准，改动前先看 AGENTS.md
@@ -58,6 +61,7 @@ const DEFAULT_CONFIG = {
   maxPendingBytes: 1048576, // 预连接窗口内每条流最多缓存 1MiB 早期数据，超限即快速失败
   maxFallbackIPs: 16, // ?fallbackip= 条数上限，防止单条 CONNECT 拉出超长拨号链
   proxyAll: false, // ?proxy-all= 默认关（query 参数，非环境变量）
+  socks5Proxy: "", // SOCKS5_PROXY：proxy-all 模式的默认 socks5 出口（环境变量，逗号分隔）
   enableDynamicNodes: true,
   dynamicNodesUrl: "",
   dynamicNodesTimeout: 3000, // 拉取动态列表超时 3s，失败直接降级
@@ -89,6 +93,7 @@ function buildConfigFromEnv(env) {
     maxStreamsPerConnection: parseEnvInt(env.MAX_STREAMS_PER_CONNECTION, DEFAULT_CONFIG.maxStreamsPerConnection, { min: 1, max: 256 }),
     maxPendingBytes: parseEnvInt(env.MAX_PENDING_BYTES, DEFAULT_CONFIG.maxPendingBytes, { min: 16384, max: 8388608 }),
     maxFallbackIPs: parseEnvInt(env.MAX_FALLBACK_IPS, DEFAULT_CONFIG.maxFallbackIPs, { min: 1, max: 64 }),
+    socks5Proxy: (env.SOCKS5_PROXY || "").trim(),
     enableDynamicNodes: parseEnvBool(env.ENABLE_DYNAMIC_NODES, DEFAULT_CONFIG.enableDynamicNodes),
     dynamicNodesUrl: (env.DYNAMIC_NODES_URL || "").trim(),
     dynamicNodesTimeout: parseEnvInt(env.DYNAMIC_NODES_TIMEOUT, DEFAULT_CONFIG.dynamicNodesTimeout, { min: 500, max: 30000 }),
@@ -199,6 +204,59 @@ function parseFallbackEntry(entry, defaultPort) {
   // 端口前的主机名不含冒号时，尾段才是端口（host:port）；否则整串是裸 IPv6，同样继承端口
   if (s.substring(0, sep).includes(":")) return { host: s, port: defaultPort };
   return withPort(s.substring(0, sep), s.substring(sep + 1));
+}
+
+// 解析 socks5 出口配置：`[socks5h?://][user:pass@]host[:port]`，缺省端口 1080。
+// 与 parseFallbackEntry 不同：**不继承目标端口**——代理端口和目标端口无关，
+// 缺端口一律 1080。含凭据的条目绝不可让凭据进日志（见 maskSocks5）。
+function parseSocks5Config(entry) {
+  let s = String(entry || "").trim().replace(/^socks5h?:\/\//i, "");
+  if (!s) return null;
+  let user = "", pass = "";
+  const at = s.lastIndexOf("@");
+  if (at !== -1) {
+    const cred = s.substring(0, at);
+    const ci = cred.indexOf(":");
+    if (ci === -1) user = cred;
+    else { user = cred.substring(0, ci); pass = cred.substring(ci + 1); }
+    s = s.substring(at + 1);
+  }
+  const p = parseFallbackEntry(s, 1080);
+  return p ? { host: p.host, port: p.port, user, pass } : null;
+}
+
+// 日志/异常里脱敏 socks5 条目：把 user:pass@ 替换成 ***@（凭据绝不落日志）
+function maskSocks5(entry) {
+  return String(entry || "").replace(/\/\/[^@/]*@/, "//***@");
+}
+
+// 把目标地址编码成 SOCKS5 CONNECT 的 ATYP+地址：IPv4→1、域名/IPv6(文字)→3
+// IPv6 走 ATYP3 字面量传递：体积预算内不内嵌 v6→16 字节解析器；多数 socks5 服务端
+// 能按字面量解析（个别严格实现需 IPv4/IPv6 直连目标时注意）。
+function socks5TargetAddr(host) {
+  if (/^\d{1,3}(\.\d{1,3}){3}$/.test(host)) {
+    const p = host.split(".").map(Number);
+    if (p.every((x) => x >= 0 && x <= 255)) return { atyp: 1, addr: Uint8Array.of(p[0], p[1], p[2], p[3]) };
+    return null;
+  }
+  const a = encoder.encode(host);
+  if (!a.length || a.length > 255) return null;
+  return { atyp: 3, addr: a };
+}
+
+// ---- SOCKS5 握手读缓冲 ----------------
+function byteLen(buf) { let t = 0; for (const c of buf) t += c.byteLength; return t; }
+// 取出前 n 字节，多读的留在缓冲里（那是隧道字节，交还 pump）
+function takeBytes(buf, n) {
+  const out = new Uint8Array(n);
+  let o = 0;
+  while (o < n) {
+    const c = buf[0], t = Math.min(c.byteLength, n - o);
+    out.set(c.subarray(0, t), o);
+    o += t;
+    if (t === c.byteLength) buf.shift(); else buf[0] = c.subarray(t);
+  }
+  return out;
 }
 
 // 逗号分隔的地址列表（?fallbackip= 与 FALLBACK_IPS 通用）
@@ -401,6 +459,7 @@ class StreamManager {
       dialing: null, // 在途（尚未就绪）的 socket
       remoteWriter: null,
       remoteReader: null,
+      remoteHead: null, // socks5 握手期多读的隧道字节，pump 先发
       isClosed: false,
       closeNotified: false, // 是否已回过 CLOSE（每条流至多一帧）
       tcpConnected: false,
@@ -419,12 +478,35 @@ class StreamManager {
       return false;
     }
     const { host, port } = target;
-    const proxyAll = this.config.proxyAll === true;
-    // 出口顺序：直连 > 客户端传入 fallback > 动态节点 > 静态 fallback
-    // 1. 直连优先（?proxy-all=true 时整段跳过）
-    if (proxyAll) {
-      this.log(`[${streamId}] ?proxy-all=true：跳过直连，直接从回退链起步`);
-    } else {
+    // ==== proxy-all 模式：只用 socks5 出口 ====
+    // v0.1.3 起的新语义（替代 v0.1.2 的「跳过直连仍走 L4 回退链」，见 CHANGELOG）：
+    // 不做直连、不碰旧的 fallback 链。出口配置来自 ?fallbackip=（此时必须是 socks5
+    // 配置）与环境变量 SOCKS5_PROXY；首连失败自动试下一个，全部失败回 CLOSE。
+    if (this.config.proxyAll === true) {
+      const proxies = this.config.cfSocks5ProxyList || [];
+      const seen = new Set();
+      let tried = false;
+      for (const entry of proxies) {
+        const parsed = parseSocks5Config(entry);
+        if (!parsed) { this.log(`[${streamId}] 跳过非法socks5出口: ${maskSocks5(entry)}`); continue; }
+        const key = `${parsed.host.toLowerCase()}:${parsed.port}`;
+        if (seen.has(key)) continue;
+        seen.add(key);
+        tried = true;
+        const r = await this.tryDialSocks5(stream, host, port, parsed);
+        if (r === "connected") return true;
+        if (r === "aborted") return false;
+      }
+      if (!tried) {
+        logError("Mux", "?proxy-all=true 但无可用 socks5 出口（?fallbackip= 为空或全部非法，且未设 SOCKS5_PROXY）");
+      }
+      this.sendCloseFor(stream);
+      this.closeStreamObject(stream);
+      return false;
+    }
+
+    // ==== 非 proxy-all：直连 > 客户端 ?fallbackip=(L4) > 动态节点 > 静态 FALLBACK_IPS ====
+    {
       const r = await this.tryDial(stream, host, port, "直连");
       if (r === "connected") return true;
       if (r === "aborted") return false;
@@ -436,11 +518,9 @@ class StreamManager {
       this.log("客户端 ?fallbackip= 与动态/静态回退已被 ENABLE_FALLBACK=false 全部关闭");
     }
 
-    let attempted = 0;
     if (this.config.enableFallback) {
-      // 去重集合：只在直连**真的试过**时播种——proxy-all 跳过直连后，
-      // 与目标同址的回退条目才是用户真正想用的出口，不能被当成"已试"跳过
-      const seenHosts = new Set(proxyAll ? [] : [`${host.toLowerCase()}:${port}`]);
+      // 去重集合：前面已试过的，后面不再重复试（直连已试过，播种进去）
+      const seenHosts = new Set([`${host.toLowerCase()}:${port}`]);
 
       // 出口链 2~4 级，顺序即对外契约（AGENTS 约束 6）：
       //   客户端 ?fallbackip= > 动态节点 API > 静态 FALLBACK_IPS
@@ -463,19 +543,12 @@ class StreamManager {
           if (seenHosts.has(key)) continue;
           seenHosts.add(key);
           n++;
-          attempted++;
           const r = await this.tryDial(stream, parsed.host, parsed.port, `${label}[${n}/${list.length}]`);
           if (r === "connected") return true;
           if (r === "aborted") return false;
         }
         this.log(`[${streamId}] ${label}: 尝试 ${n}/${list.length} 个出口`);
       }
-    }
-
-    // proxy-all 却一条出口都没试到：补一句人话日志，否则客户端只看到裸 CLOSE 无法定位
-    // （ENABLE_FALLBACK=false，或 ?fallbackip=/动态节点/FALLBACK_IPS 全空）
-    if (proxyAll && attempted === 0) {
-      logError("Mux", "?proxy-all=true 但无任何可用回退出口（?fallbackip= / 动态节点 / FALLBACK_IPS 均为空，或 ENABLE_FALLBACK=false）");
     }
 
     // 所有尝试都失败：回 CLOSE 让客户端立即失败（否则客户端只能等自己的超时），再清理预注册的流
@@ -485,7 +558,7 @@ class StreamManager {
   }
 
   /**
-   * 单次拨号并绑定到流
+   * 单次拨号并绑定到流（直连/直连直拨 L4 出口）
    * @param {object} stream 本代流对象（身份凭据：await 回来后据此判断自己是否已被换掉）
    * @returns {Promise<"connected" | "aborted" | "failed">} connected=成功停手，aborted=流已没（停手不再试），failed=可试下一个
    */
@@ -517,56 +590,164 @@ class StreamManager {
         try { remoteSocket.close(); } catch {}
         return "aborted";
       }
-      stream.remoteSocket = remoteSocket;
-      stream.remoteWriter = remoteWriter;
-      stream.remoteReader = remoteReader;
 
-      this.log(`[${streamId}] ${attemptDesc}成功`);
-
-      // Flush 缓存的早期数据到远程 socket
-      if (stream.pendingBuffer.length > 0) {
-        this.log(`[${streamId}] flush ${stream.pendingBuffer.length} 条缓存数据`);
-        for (const pending of stream.pendingBuffer) {
-          try {
-            await remoteWriter.write(pending.chunk);
-            // 写出即释放额度：早期数据的计量只是"暂存"，写完必须回退，
-            // 否则这条流的在途预算被历史早期数据永久占用，后续正常 DATA 会被误杀
-            stream.pendingBytes -= pending.cost;
-          } catch (e) {
-            this.log(`[${streamId}] flush 写入失败: ${e.message}`);
-            // 尚未 sendConnected，也没有 pump 兜底发 CLOSE，必须自己回一帧让客户端快速失败
-            this.sendCloseFor(stream);
-            this.closeStreamObject(stream);
-            return "aborted";
-          }
-        }
-        stream.pendingBuffer = [];
-      }
-
-      // flush 循环里有 await，流可能在此期间被客户端关闭、或被同 streamId 的新 CONNECT 接管；
-      // 置位 tcpConnected / 发 CONNECTED / 起 pump 之前必须再确认一次身份，
-      // 否则旧代仍会为已被换掉的 id 发第二帧 CONNECTED（双 CONNECTED 窗口）
-      if (stream.isClosed || this.streams.get(streamId) !== stream) {
-        try { remoteWriter.releaseLock(); } catch {}
-        try { remoteSocket.close(); } catch {}
-        return "aborted";
-      }
-
-      // 必须等 flush 结束再置位：flush 期间到达的客户端 DATA 要继续进 pendingBuffer，
-      // 否则会插到未写完的缓存条目中间，破坏发往目标的字节序（TLS/HTTP 会被判协议错误）
-      stream.tcpConnected = true;
-
-      this.sendFrame(streamId, MSG_TYPE.CONNECTED);
-
-      // 启动数据转发
-      this.pumpRemoteToWebSocket(stream, remoteReader);
-
-      return "connected";
+      return await this.bindStream(stream, remoteSocket, remoteWriter, remoteReader);
     } catch (err) {
       this.log(`[${streamId}] ${attemptDesc}失败: ${err.message}`);
       // 流已死（客户端 CLOSE / WS 关闭 / 被同 id 新流换掉）就停手，别再遍历剩余出口
       return stream.isClosed || this.streams.get(streamId) !== stream ? "aborted" : "failed";
     }
+  }
+
+  /**
+   * 通过 socks5 代理建流：握手（方法协商 → 可选认证 → CONNECT 目标）后在代理上开隧道。
+   * 握手期多读的字节会暂存 remoteHead，交给 pump 先发（不能误吞目标的提前响应）。
+   * @returns {Promise<"connected" | "aborted" | "failed">}
+   */
+  async tryDialSocks5(stream, targetHost, targetPort, proxy) {
+    const streamId = stream.id;
+    if (stream.isClosed) return "aborted";
+    const desc = `socks5[${proxy.host}:${proxy.port}]`;
+    try {
+      const remoteSocket = await dialWithTimeout(
+        proxy.host, proxy.port, this.config.connectTimeout,
+        (sock) => { stream.dialing = sock; },
+      );
+      stream.dialing = null;
+      const remoteWriter = remoteSocket.writable.getWriter();
+      const remoteReader = remoteSocket.readable.getReader();
+      const buf = []; // 握手读缓冲（多读字节交还 pump）
+      const cln = () => { try { remoteWriter.releaseLock(); } catch {} try { remoteSocket.close(); } catch {} };
+      if (stream.isClosed || this.streams.get(streamId) !== stream) { cln(); return "aborted"; }
+      const deadline = Date.now() + this.config.connectTimeout;
+      const readTo = async (n) => { // 缓冲 ≥ n 字节；超时按异常抛，落外层 catch
+        while (byteLen(buf) < n) {
+          const wait = deadline - Date.now();
+          if (wait <= 0) return false;
+          const { done, value } = await Promise.race([
+            remoteReader.read(),
+            new Promise((_, rej) => setTimeout(() => rej(new Error("socks5 timeout")), wait)),
+          ]);
+          if (done) return false;
+          if (value?.byteLength) buf.push(new Uint8Array(value));
+        }
+        return true;
+      };
+      const bail = (m) => { cln(); throw new Error(m); };
+      // 1) 方法协商：有凭据仅提议 user/pass(0x02)，否则提议无认证(0x00)
+      await remoteWriter.write(new Uint8Array(proxy.user ? [5, 1, 2] : [5, 1, 0]));
+      if (!(await readTo(2))) bail("代理无响应");
+      const method = takeBytes(buf, 2)[1];
+      if (method === 2) {
+        const u = encoder.encode(proxy.user || ""), p = encoder.encode(proxy.pass || "");
+        if (!u.length || u.length > 255 || p.length > 255) bail("凭据过长");
+        const ab = new Uint8Array(3 + u.length + p.length);
+        ab[0] = 1; ab[1] = u.length; ab.set(u, 2); ab[2 + u.length] = p.length; ab.set(p, 3 + u.length);
+        await remoteWriter.write(ab);
+        if (!(await readTo(2))) bail("认证无响应");
+        const rs = takeBytes(buf, 2);
+        if (rs[0] !== 1 || rs[1] !== 0) bail("代理认证失败");
+      } else if (method !== 0) {
+        bail(proxy.user ? "代理拒绝 user/pass 认证" : "代理要求认证");
+      }
+      // 2) CONNECT 目标（原始 host:port；ATYP 3 域名需 1 字节长度，1/4 直接跟地址）
+      const ta = socks5TargetAddr(targetHost);
+      if (!ta) bail("目标无法编码为 socks5 地址");
+      const gap = ta.atyp === 3 ? 1 : 0;
+      const req = new Uint8Array(4 + gap + ta.addr.length + 2);
+      req[0] = 5; req[1] = 1; req[2] = 0; req[3] = ta.atyp;
+      let ro = 4;
+      if (gap) { req[ro] = ta.addr.length; ro++; }
+      req.set(ta.addr, ro);
+      req[ro + ta.addr.length] = (targetPort >> 8) & 255;
+      req[ro + ta.addr.length + 1] = targetPort & 255;
+      await remoteWriter.write(req);
+      if (!(await readTo(4))) bail("代理无响应");
+      const rep = takeBytes(buf, 4);
+      if (rep[0] !== 5 || rep[1] !== 0) bail(`代理拒绝 ${rep[1]}`);
+      let tail = 2;
+      if (rep[3] === 1) tail += 4;
+      else if (rep[3] === 3) tail += 1;
+      else if (rep[3] === 4) tail += 16;
+      else bail(`未知 ATYP ${rep[3]}`);
+      // 首 4 字节已消费，再收 tail 字节的 BND.ADDR/PORT
+      if (!(await readTo(tail))) bail("代理无响应");
+      takeBytes(buf, tail);
+      // 握手期多读的隧道字节交还 pump
+      if (buf.length) {
+        if (buf.length === 1) stream.remoteHead = buf[0];
+        else {
+          const all = new Uint8Array(byteLen(buf));
+          let o = 0;
+          for (const c of buf) { all.set(c, o); o += c.byteLength; }
+          stream.remoteHead = all;
+        }
+        buf.length = 0;
+      }
+      this.log(`[${streamId}] ${desc} 出口成功`);
+      return await this.bindStream(stream, remoteSocket, remoteWriter, remoteReader);
+    } catch (err) {
+      this.log(`[${streamId}] ${desc} 失败: ${err.message}`);
+      return stream.isClosed || this.streams.get(streamId) !== stream ? "aborted" : "failed";
+    }
+  }
+
+  /**
+   * 流绑定的公共尾部（直连与 socks5 共用）：身份复查 → flush 早期数据 → 置位 tcpConnected →
+   * CONNECTED → 起 pump。flush 循环里有 await，期间流可能被关/被换，身份务必复查。
+   */
+  async bindStream(stream, remoteSocket, remoteWriter, remoteReader) {
+    const streamId = stream.id;
+    if (stream.isClosed || this.streams.get(streamId) !== stream) {
+      try { remoteWriter.releaseLock(); } catch {}
+      try { remoteSocket.close(); } catch {}
+      return "aborted";
+    }
+    stream.remoteSocket = remoteSocket;
+    stream.remoteWriter = remoteWriter;
+    stream.remoteReader = remoteReader;
+
+    this.log(`[${streamId}] 流已就绪`);
+
+    // Flush 缓存的早期数据到远程 socket
+    if (stream.pendingBuffer.length > 0) {
+      this.log(`[${streamId}] flush ${stream.pendingBuffer.length} 条缓存数据`);
+      for (const pending of stream.pendingBuffer) {
+        try {
+          await remoteWriter.write(pending.chunk);
+          // 写出即释放额度：早期数据的计量只是"暂存"，写完必须回退，
+          // 否则这条流的在途预算被历史早期数据永久占用，后续正常 DATA 会被误杀
+          stream.pendingBytes -= pending.cost;
+        } catch (e) {
+          this.log(`[${streamId}] flush 写入失败: ${e.message}`);
+          // 尚未 sendConnected，也没有 pump 兜底发 CLOSE，必须自己回一帧让客户端快速失败
+          this.sendCloseFor(stream);
+          this.closeStreamObject(stream);
+          return "aborted";
+        }
+      }
+      stream.pendingBuffer = [];
+    }
+
+    // flush 循环里有 await，流可能在此期间被客户端关闭、或被同 streamId 的新 CONNECT 接管；
+    // 置位 tcpConnected / 发 CONNECTED / 起 pump 之前必须再确认一次身份，
+    // 否则旧代仍会为已被换掉的 id 发第二帧 CONNECTED（双 CONNECTED 窗口）
+    if (stream.isClosed || this.streams.get(streamId) !== stream) {
+      try { remoteWriter.releaseLock(); } catch {}
+      try { remoteSocket.close(); } catch {}
+      return "aborted";
+    }
+
+    // 必须等 flush 结束再置位：flush 期间到达的客户端 DATA 要继续进 pendingBuffer，
+    // 否则会插到未写完的缓存条目中间，破坏发往目标的字节序（TLS/HTTP 会被判协议错误）
+    stream.tcpConnected = true;
+
+    this.sendFrame(streamId, MSG_TYPE.CONNECTED);
+
+    // 启动数据转发
+    this.pumpRemoteToWebSocket(stream, remoteReader);
+
+    return "connected";
   }
 
   /**
@@ -632,6 +813,7 @@ class StreamManager {
     if (!stream || stream.isClosed) return;
 
     stream.isClosed = true;
+    stream.remoteHead = null; // 握手期的残余字节随流一起弃掉
 
     // 清理缓存
     stream.pendingBuffer = [];
@@ -696,6 +878,12 @@ class StreamManager {
   async pumpRemoteToWebSocket(stream, remoteReader) {
     const streamId = stream.id;
     try {
+      // socks5 握手期多读的隧道字节（目标提前响应）先发出去
+      if (stream.remoteHead?.byteLength) {
+        if (stream.isClosed || this.streams.get(streamId) !== stream) return;
+        this.sendFrame(streamId, MSG_TYPE.DATA, stream.remoteHead);
+        stream.remoteHead = null;
+      }
       while (true) {
         const { done, value } = await remoteReader.read();
 
@@ -776,15 +964,25 @@ export default {
         const envFallbackIPs = splitList(env.FALLBACK_IPS);
         // 静态 fallback 只从环境变量读取，不再合并硬编码默认值
         const staticFallbackIPs = dedupList([...envFallbackIPs]);
-        // ?proxy-all= 连接级开关：true 时本连接所有流跳过直连，直接走回退链
+        // ?proxy-all= 连接级开关：true 时本连接所有流跳过直连与旧出口链，只用 socks5 出口。
         // （沿用 parseEnvBool 的真值集合；缺省 false。客户端可控，与 ?fallbackip= 同信任级）
         const proxyAll = parseEnvBool(url.searchParams.get("proxy-all"), DEFAULT_CONFIG.proxyAll);
+        // socks5 出口列表（仅在 proxy-all 模式使用）：客户端 ?fallbackip=（此时必须是 socks5
+        // 配置）优先，其次环境变量 SOCKS5_PROXY；合并不去重（去重在拨号处按 host:port 做）
+        const socks5ProxyList = dedupList([
+          ...queryFallbackIPs,
+          ...splitList(env.SOCKS5_PROXY),
+        ]);
+        if (socks5ProxyList.length > baseConfig.maxFallbackIPs) {
+          socks5ProxyList.length = baseConfig.maxFallbackIPs;
+        }
 
         const config = {
           ...baseConfig,
           proxyAll,
           cfQueryFallbackIPs: queryFallbackIPs,
           cfFallbackIPs: staticFallbackIPs,
+          cfSocks5ProxyList: socks5ProxyList,
         };
 
         // 4. 建立连接

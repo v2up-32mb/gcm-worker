@@ -4,6 +4,37 @@
 
 ---
 
+## 未发版（v0.1.3，待批准打 tag）
+
+**Changed（破坏性语义变更，v0.1.2 已发布过旧语义）**
+
+- **`?proxy-all=true` 从「跳过直连仍走 L4 回退链」改为「只用 socks5 出口」**：
+  设为真值时所有流**跳过直连与 L4 回退链**，直接向 socks5 代理建流——Worker 完成 SOCKS5
+  握手（方法协商 → 可选 user/pass 认证 → CONNECT 携带**原始目标**，ATYP 按地址形态：
+  IPv4→1、域名/IPv6 文字→3），隧道建立后照常 CONNECTED / flush / 双向泵。
+  - 出口配置：`?fallbackip=`（此时每项必须是 socks5 配置 `[socks5h?://][user:pass@]host[:port]`，
+    缺端口默认 1080）+ 新增环境变量 `SOCKS5_PROXY`（逗号分隔）；客户端条目优先，可多台，
+    首代理失败自动试下一个。
+  - 无任何 socks5 配置时**零拨号**回 CLOSE，记 `?proxy-all=true 但无可用 socks5 出口`。
+  - **升级指引（破坏性，仅影响 v0.1.2 起的 proxy-all 用户）**：v0.1.2 部署的 proxy-all 用户
+    若 `?fallbackip=` 是 L4 覆盖项，本版起会被当作 socks5 服务器连接并失败——请改配真实
+    socks5 代理（或改用不太用 proxy-all）。不传 proxy-all 的行为与 v0.1.1 逐字节一致。
+  - 已知取舍：IPv6 目标以 ATYP3 字面量传递（体积预算内不内嵌 v6→16 字节解析器）；
+    多数 socks5 服务端可解析，个别严格实现不支持 IPv6 文字域名目标。
+
+**Fixed**
+
+- 握手期多读的字节不再丢失：socks5 握手与目标的提前响应可能共存于一次 read
+  （此前会吞掉隧道首包），现把多读字节暂存 `remoteHead` 由 pump 先发。
+
+**Build**
+
+- **Snippets 体积预算 16KiB/6KiB → 18KiB/7KiB**：为容纳 socks5 出口（含凭据解析与握手），
+  预算上调。依据：Cloudflare Snippets 平台硬限为 **32KB 总包**（另限 5ms CPU/2MB 内存），
+  新预算仍仅为平台限的 ~56%/22%，留足执行窗口余量。见 `scripts/build.mjs`。
+
+---
+
 ## v0.1.2 — 2026-09-29
 
 **Added**

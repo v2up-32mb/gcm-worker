@@ -25,9 +25,50 @@ async function loadInternals() {
     .replace(/^import[\s\S]*?;$/m, "")
     .replace(/export default \{[\s\S]*?\n\};/, ""); // 去掉 fetch 入口
   const fn = new Function(
-    `${body}\nreturn { parseAddress, parseFallbackEntry, normalizeNodeEntry, buildConfigFromEnv, parseEnvBool, parseEnvInt, cleanLog };`,
+    `${body}\nreturn { parseAddress, parseFallbackEntry, normalizeNodeEntry, buildConfigFromEnv, parseEnvBool, parseEnvInt, cleanLog, parseSocks5Config, socks5TargetAddr };`,
   );
   return fn();
+}
+
+/** 在 stub socket 上扮演 socks5 代理：按序回复握手，返回捕到的 CONNECT 目标 */
+async function socks5Server(sock, { auth } = {}) {
+  const out = {};
+  // 1) 方法协商
+  await waitFor(() => sock.toTarget.length >= 1, { label: "代理收到 greeting" });
+  const greeting = Buffer.from(sock.toTarget[0]);
+  out.greeting = greeting;
+  if (greeting[0] !== 5) throw new Error(`非 SOCKS5 greeting: ${greeting}`);
+  const methods = [...greeting.subarray(2)];
+  let method = 0;
+  if (auth) {
+    if (!methods.includes(2)) throw new Error("客户端未提议 user/pass");
+    method = 2;
+  } else if (methods.includes(0)) {
+    method = 0;
+  } else {
+    sock.enqueueToClient([5, 0xff]);
+    throw new Error("客户端未提议无认证");
+  }
+  sock.enqueueToClient([5, method]);
+  // 2)（可选）认证子协商
+  if (method === 2) {
+    await waitFor(() => sock.toTarget.length >= 2, { label: "代理收到认证凭据" });
+    out.authSeen = Buffer.from(sock.toTarget[1]);
+    sock.enqueueToClient([1, 0]);
+  }
+  // 3) CONNECT 请求
+  const reqIdx = method === 2 ? 2 : 1;
+  await waitFor(() => sock.toTarget.length >= reqIdx + 1, { label: "代理收到 CONNECT" });
+  const req = Buffer.from(sock.toTarget[reqIdx]);
+  if (req[0] !== 5 || req[1] !== 1) throw new Error(`非 CONNECT 请求: ${req}`);
+  let addr;
+  if (req[3] === 1) addr = [...req.subarray(4, 8)];
+  else if (req[3] === 3) addr = req.subarray(5, 5 + req[4]).toString();
+  else if (req[3] === 4) addr = [...req.subarray(4, 20)];
+  else throw new Error(`未知 ATYP ${req[3]}`);
+  out.connect = { atyp: req[3], addr, port: req[req.length - 2] * 256 + req[req.length - 1] };
+  sock.enqueueToClient([5, 0, 0, 1, 127, 0, 0, 1, 0, 0]); // 成功，BND=IPv4
+  return out;
 }
 
 const internals = await loadInternals();
@@ -79,6 +120,35 @@ describe("纯函数", () => {
     const parsed = internals.parseFallbackEntry(n("1.2.3.4:8081", ""), 443);
     assert.equal(parsed && parsed.host, "1.2.3.4", "自带端口的条目应被正确拆分出 host");
     assert.equal(parsed && parsed.port, 8081, "自带端口的条目应被正确拆分出 port");
+  });
+
+  test("parseSocks5Config：scheme/凭据/端口/IPv6 形态，缺端口默认 1080", () => {
+    const p = internals.parseSocks5Config;
+    assert.deepEqual(p("1.2.3.4:1080"), { host: "1.2.3.4", port: 1080, user: "", pass: "" });
+    assert.deepEqual(p("socks5://1.2.3.4"), { host: "1.2.3.4", port: 1080, user: "", pass: "" });
+    assert.deepEqual(p("socks5h://user:pass@1.2.3.4:1081"), { host: "1.2.3.4", port: 1081, user: "user", pass: "pass" });
+    assert.deepEqual(p("u:p@[2606:4700::1]:1080"), { host: "2606:4700::1", port: 1080, user: "u", pass: "p" });
+    assert.deepEqual(p("proxy.example"), { host: "proxy.example", port: 1080, user: "", pass: "" });
+    assert.equal(p(""), null);
+    assert.equal(p("1.2.3.4:99999"), null);
+    assert.equal(p("1.2.3.4:notaport"), null);
+  });
+
+  test("socks5TargetAddr：IPv4→ATYP1 / 域名与 IPv6(文字)→ATYP3", () => {
+    const t = internals.socks5TargetAddr;
+    const v4 = t("1.2.3.4");
+    assert.equal(v4.atyp, 1);
+    assert.deepEqual([...v4.addr], [1, 2, 3, 4]);
+    // 裸 IPv6 按 ATYP3 字面量传（体积预算内不内嵌 v6→16 字节解析器；多数 socks5 服务端能按字面量解析）
+    const v6 = t("2606:4700::1");
+    assert.equal(v6.atyp, 3);
+    assert.equal(v6.addr.length, 12); // "2606:4700::1" 12 字符
+    assert.equal(v6.addr[0], 0x32); // '2'
+    const dom = t("example.com");
+    assert.equal(dom.atyp, 3);
+    assert.equal(dom.addr.length, 11);
+    assert.equal(t(""), null);
+    assert.equal(t("999.1.1.1"), null, "非法 IPv4 不落 ATYP1");
   });
 
   test("buildConfigFromEnv 解析布尔/整数并做范围钳制", () => {
@@ -254,90 +324,119 @@ for (const [label, worker] of VARIANTS) {
       }
     });
 
-    test("?proxy-all=true：跳过直连，直接从 ?fallbackip= 起步（对外契约）", async () => {
-      setPolicy(() => "reject");
+    test("?proxy-all=true：只用 socks5 出口，直连与 L4 链完全不碰（新语义）", async () => {
+      setPolicy((opts) => (opts.hostname === "sockshost.example" ? "open" : "reject"));
       const { server } = await openSession(worker, {
-        query: "?fallbackip=q.example&proxy-all=true",
+        query: "?fallbackip=sockshost.example:1080&proxy-all=true",
         envVars: { FALLBACK_IPS: "static.example" },
       });
       await server.fromClient(connectFrame(11, "direct.example", 443));
-      await waitFor(() => server.typesOf(11).includes(T.CLOSE), { label: "全链失败 CLOSE" });
+      await waitFor(() => sockets().length >= 1, { label: "拨 socks5 出口" });
+      const hs = await socks5Server(sockets()[0]);
+      await waitFor(() => server.typesOf(11).includes(T.CONNECTED), { label: "CONNECTED" });
       assert.deepEqual(
         sockets().map((s) => s.opts.hostname),
-        ["q.example", "static.example"],
-        "直连不应被尝试，回退链顺序不变",
+        ["sockshost.example"],
+        "直连与 static.example 都不该出现",
       );
+      assert.deepEqual([...hs.greeting], [5, 1, 0], "无认证 greeting");
+      assert.equal(hs.connect.addr, "direct.example", "目标域名原样交给代理");
+      assert.equal(hs.connect.port, 443, "目标端口原样交给代理");
+      assert.equal(server.typesOf(11)[0], T.CONNECTED, "CONNECTED 是第一帧");
     });
 
-    test("?proxy-all= 真值集合：1/yes/on 生效，缺省与假值不生效", async () => {
+    test("socks5 首代理拒绝方法 → 自动试下一个并成功", async () => {
+      setPolicy((opts) => ["p1.example", "p2.example"].includes(opts.hostname) ? "open" : "reject");
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=p1.example:1080,p2.example:1080&proxy-all=true",
+      });
+      await server.fromClient(connectFrame(12, "target.example", 443));
+      await waitFor(() => sockets().length >= 1, { label: "拨 p1" });
+      const s1 = sockets()[0];
+      await waitFor(() => s1.toTarget.length >= 1, { label: "p1 收到 greeting" });
+      s1.enqueueToClient([5, 0xff]); // 拒绝所有方法
+      await waitFor(() => sockets().length >= 2, { label: "拨 p2" });
+      const hs = await socks5Server(sockets()[1]);
+      await waitFor(() => server.typesOf(12).includes(T.CONNECTED), { label: "p2 CONNECTED" });
+      assert.deepEqual(sockets().map((s) => s.opts.hostname), ["p1.example", "p2.example"]);
+      assert.equal(hs.connect.addr, "target.example");
+    });
+
+    test("socks5 出口来自 SOCKS5_PROXY 环境变量（无需 ?fallbackip=）", async () => {
+      setPolicy((opts) => (opts.hostname === "envproxy.example" ? "open" : "reject"));
+      const { server } = await openSession(worker, {
+        query: "?proxy-all=true",
+        envVars: { SOCKS5_PROXY: "envproxy.example:1080" },
+      });
+      await server.fromClient(connectFrame(13, "example.com", 443));
+      await waitFor(() => sockets().length >= 1, { label: "拨环境变量 sock5" });
+      const hs = await socks5Server(sockets()[0]);
+      await waitFor(() => server.typesOf(13).includes(T.CONNECTED), { label: "CONNECTED" });
+      assert.equal(hs.connect.addr, "example.com");
+    });
+
+    test("socks5 带 user:pass 认证：只提议 0x02 且认证子协商正确", async () => {
+      setPolicy((opts) => (opts.hostname === "auth.example" ? "open" : "reject"));
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=user:pass@auth.example:1080&proxy-all=true",
+      });
+      await server.fromClient(connectFrame(14, "example.com", 443));
+      await waitFor(() => sockets().length >= 1, { label: "拨带认证 proxy" });
+      const hs = await socks5Server(sockets()[0], { auth: "user:pass" });
+      await waitFor(() => server.typesOf(14).includes(T.CONNECTED), { label: "CONNECTED" });
+      assert.deepEqual([...hs.greeting], [5, 1, 2], "有凭据应只提议 user/pass");
+      const a = hs.authSeen;
+      assert.equal(a[0], 1);
+      assert.equal(a[1], 4);
+      assert.equal(a.subarray(2, 6).toString(), "user");
+      assert.equal(a[6], 4);
+      assert.equal(a.subarray(7, 11).toString(), "pass");
+    });
+
+    test("proxy-all=true 但无任何 socks5 配置 → 零拨号直接 CLOSE，不得偷跑直连", async () => {
+      setPolicy(() => "open"); // 直连本可成功，也要 fail-close
+      const { server } = await openSession(worker, { query: "?proxy-all=true" });
+      await server.fromClient(connectFrame(3, "direct.example", 443));
+      await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "CLOSE" });
+      assert.equal(sockets().length, 0, "无 socks5 配置不得回退直连");
+    });
+
+    test("proxy-all=true 不受 ENABLE_FALLBACK=false 影响（socks5 不是 L4 回退链）", async () => {
+      setPolicy((opts) => (opts.hostname === "p.example" ? "open" : "reject"));
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=p.example:1080&proxy-all=true",
+        envVars: { ENABLE_FALLBACK: "false" },
+      });
+      await server.fromClient(connectFrame(4, "example.com", 443));
+      await waitFor(() => sockets().length >= 1, { label: "拨 socks5" });
+      const hs = await socks5Server(sockets()[0]);
+      await waitFor(() => server.typesOf(4).includes(T.CONNECTED), { label: "CONNECTED" });
+      assert.equal(hs.connect.addr, "example.com", "ENABLE_FALLBACK 不拦截 socks5 出口");
+    });
+
+    test("?proxy-all= 真值集合：1/yes/on 生效走 socks5，缺省与假值保持直连优先", async () => {
       for (const v of ["1", "yes", "on", "TRUE"]) {
         resetStub();
-        setPolicy(() => "reject");
-        const { server } = await openSession(worker, { query: `?fallbackip=q.example&proxy-all=${v}` });
-        await server.fromClient(connectFrame(1, "direct.example", 443));
-        await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: `proxy-all=${v} 全败 CLOSE` });
-        assert.deepEqual(
-          sockets().map((s) => s.opts.hostname),
-          ["q.example"],
-          `proxy-all=${v} 应跳过直连`,
-        );
+        setPolicy((opts) => (opts.hostname === "p.example" ? "open" : "reject"));
+        const { server } = await openSession(worker, { query: `?fallbackip=p.example:1080&proxy-all=${v}` });
+        await server.fromClient(connectFrame(1, "example.com", 443));
+        await waitFor(() => sockets().length >= 1, { label: `proxy-all=${v} 拨 socks5` });
+        await socks5Server(sockets()[0]);
+        await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: `CONNECTED ${v}` });
+        assert.deepEqual(sockets().map((s) => s.opts.hostname), ["p.example"], `${v} 应走 socks5`);
       }
       for (const q of ["", "&proxy-all=false", "&proxy-all=0", "&proxy-all=nope"]) {
         resetStub();
-        setPolicy(() => "reject");
+        setPolicy(() => "open");
         const { server } = await openSession(worker, { query: `?fallbackip=q.example${q}` });
         await server.fromClient(connectFrame(1, "direct.example", 443));
-        await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: `缺省(${q}) 全败 CLOSE` });
+        await waitFor(() => server.typesOf(1).includes(T.CONNECTED), { label: `缺省(${q}) 直连成功` });
         assert.deepEqual(
           sockets().map((s) => s.opts.hostname),
-          ["direct.example", "q.example"],
+          ["direct.example"],
           `缺省/假值(${q}) 必须保持直连优先`,
         );
       }
-    });
-
-    test("?proxy-all=true 且回退条目与目标同址：仍应拨（回归：被去重集合误跳过）", async () => {
-      setPolicy(() => "reject");
-      const { server } = await openSession(worker, {
-        query: "?fallbackip=same.example&proxy-all=true",
-      });
-      await server.fromClient(connectFrame(2, "same.example", 443));
-      await waitFor(() => server.typesOf(2).includes(T.CLOSE), { label: "全败 CLOSE" });
-      assert.deepEqual(
-        sockets().map((s) => s.opts.hostname),
-        ["same.example"],
-        "直连没试过就不该播种去重，同址回退必须被试",
-      );
-    });
-
-    test("?proxy-all=true 但零回退可用：一个 socket 都不拨，直接 CLOSE", async () => {
-      setPolicy(() => "reject");
-      const { server } = await openSession(worker, { query: "?proxy-all=true" });
-      await server.fromClient(connectFrame(3, "direct.example", 443));
-      await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "无出口 CLOSE" });
-      assert.equal(sockets().length, 0, "无回退可用时不得回退去拨直连");
-    });
-
-    test("?proxy-all=true + ENABLE_FALLBACK=false：零拨号直接 CLOSE", async () => {
-      setPolicy(() => "reject");
-      const { server } = await openSession(worker, {
-        query: "?fallbackip=q.example&proxy-all=true",
-        envVars: { ENABLE_FALLBACK: "false" },
-      });
-      await server.fromClient(connectFrame(4, "direct.example", 443));
-      await waitFor(() => server.typesOf(4).includes(T.CLOSE), { label: "无出口 CLOSE" });
-      assert.equal(sockets().length, 0, "回退全关时不得有任何拨号");
-    });
-
-    test("?proxy-all=true 时成功走通回退：CONNECTED 正常下发", async () => {
-      setPolicy((opts) => (opts.hostname === "q.example" ? "open" : "reject"));
-      const { server } = await openSession(worker, {
-        query: "?fallbackip=q.example&proxy-all=true",
-      });
-      await server.fromClient(connectFrame(5, "direct.example", 443));
-      await waitFor(() => server.typesOf(5).includes(T.CONNECTED), { label: "回退成功 CONNECTED" });
-      assert.equal(server.typesOf(5)[0], T.CONNECTED);
-      assert.deepEqual(sockets().map((s) => s.opts.hostname), ["q.example"]);
     });
 
     test("对不存在的 streamId 发 DATA/CLOSE：零回帧且不占槽位", async () => {

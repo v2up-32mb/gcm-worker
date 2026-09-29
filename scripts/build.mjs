@@ -94,9 +94,12 @@ export function fmtSize(n) {
   return n < 1024 ? `${n} B` : `${(n / 1024).toFixed(1)} KiB`;
 }
 
-// Snippets 体积预算：超过即 CI 失败（Cloudflare Snippets 对脚本大小有限制）
-export const SIZE_BUDGET_RAW = 16 * 1024;
-export const SIZE_BUDGET_GZIP = 6 * 1024;
+// Snippets 体积预算：超过即 CI 失败。
+// 平台硬限为 32KB 总包（Cloudflare 官方：Snippets maximum total package size 32KB，
+// 另限 5ms CPU / 2MB 内存）。本预算取平台限的小半（18KiB raw / 7KiB gzip，约 56%/22%），
+// 为 5ms 执行窗口与将来新增留余量；v0.1.3 引入 socks5 出口后从 16/6 上调（详见 CHANGELOG）。
+export const SIZE_BUDGET_RAW = 18 * 1024;
+export const SIZE_BUDGET_GZIP = 7 * 1024;
 
 /** 打印体积表并对照预算；返回是否超限 */
 export function reportSize(file) {

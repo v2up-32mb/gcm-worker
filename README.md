@@ -35,19 +35,24 @@ TYPE = 3 CLOSE      无 DATA
 或节点上的「端口 → 固定目标」映射表。**Worker 不做任何握手**，因此 SOCKS5 / HTTP CONNECT
 代理不适用（那种代理要求客户端先自报家门 + 报出目标地址，裸 TCP 做不到）。
 
-### `?proxy-all=true` = 强制走出口
+### `?proxy-all=true` = 强制走 socks5 出口
 
 ```
-wss://<域名>/<USER_ID>?fallbackip=1.2.3.4:8443&proxy-all=true
+wss://<域名>/<USER_ID>?fallbackip=user:pass@socks.1.2.3.4:1080&proxy-all=true
 ```
 
-连接级开关（对本次 WebSocket 连接上**所有**流生效），默认 `false`。设为真值
-（`1/true/yes/on`，大小写不敏感）时**跳过「直连」这一级**，所有流直接从 `?fallbackip=` 起步走
-回退链——用于「所有流量必须从指定出口出去」。
+连接级开关（对本次 WebSocket 连接上**所有**流生效），默认 `false`。**v0.1.3 语义**：
+设为真值（`1/true/yes/on`，大小写不敏感）时所有流**跳过直连与 L4 回退链**，直接把流量交给
+**socks5 代理**——Worker 会与代理完成 SOCKS5 握手（方法协商 / 可选 user:pass 认证 / CONNECT
+携带原始目标），然后隧道化。适合「所有流量必须经某 socks5 代理出境」。
 
-一条回退都拿不到时（`?fallbackip=` / 动态节点 / `FALLBACK_IPS` 全空，或
-`ENABLE_FALLBACK=false`）**零拨号**直接回 CLOSE，并记
-`?proxy-all=true 但无任何可用回退出口`。客户端不传该参数时行为与之前完全一致（非破坏性）。
+- 出口配置 = `?fallbackip=`（此时每项必须是 socks5 配置，格式
+  `[socks5h?://][user:pass@]host[:port]`，缺端口默认 1080）+ 环境变量 `SOCKS5_PROXY`；
+  客户端条目优先，可多台，首连失败自动试下一个。
+- 无任何 socks5 配置时**零拨号**直接回 CLOSE，并记 `?proxy-all=true 但无可用 socks5 出口`。
+- ⚠️ **破坏性语义变更**：v0.1.2 的 proxy-all 是「跳过直连仍走 L4 回退链」，v0.1.3 起改为只用
+  socks5；若你的 `?fallbackip=` 之前是 L4 覆盖项，在 proxy-all 下会被当作 socks5 服务器连接。
+  客户端不传该参数时行为与 v0.1.1 完全一致（非破坏性）。
 
 常量的权威定义在 gcm 库仓 `protocol/message.go`；本仓用
 `npm run check:protocol` 与之比对，防止两侧漂移（详见 `AGENTS.md`）。
@@ -71,7 +76,7 @@ Dashboard 粘贴部署（最快，无需本地环境）见 [`DEPLOY.md`](DEPLOY.
 | `DEPLOY.md` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |
 | `scripts/build.mjs` | 构建 snippets 压缩版 + 体积预算；`buildTestable()` 产出测试可加载的模块 |
 | `scripts/check-protocol.mjs` | 与 gcm `protocol/message.go` 比对消息类型/头长度，防协议漂移 |
-| `test/` | Node 侧替身与 119 条用例（可读版与压缩版跑同一套） |
+| `test/` | Node 侧替身与 123 条用例（可读版与压缩版跑同一套） |
 | `wrangler.toml.example` | Wrangler 配置模板（真实 `wrangler.toml` 不入库） |
 
 ## 两种发布产物
@@ -88,7 +93,7 @@ Dashboard 粘贴部署（最快，无需本地环境）见 [`DEPLOY.md`](DEPLOY.
 ## 测试
 
 ```bash
-npm run check          # 语法 + 跨仓协议一致性 + 119 条用例（可读版 & 压缩版）
+npm run check          # 语法 + 跨仓协议一致性 + 123 条用例（可读版 & 压缩版）
 npm run check:syntax   # 仅语法
 npm run check:protocol # 仅协议一致性（未检出 gcm 库仓时降级为自检并提示）
 npm test               # 仅用例
