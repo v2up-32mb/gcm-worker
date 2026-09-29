@@ -9,6 +9,8 @@
  *   - USER_ID 取 env.USER_ID（大小写不敏感匹配），不匹配的路径一律拒绝；
  *     未配置 USER_ID 时 fail-closed：任何路径都返回 403 伪装页，不存在默认占位路径
  *   - ?fallbackip= 可重复/逗号分隔，每项支持 host 或 host:port，作为客户端侧出口偏好
+ *   - ?proxy-all=true 时本连接的所有流**跳过直连**，直接从 ?fallbackip= 起步走回退链
+ *     （连接级开关，默认 false；一条回退都拿不到时按全败回 CLOSE 并记 logError）
  *
  * 协议格式 (2字节头: [STREAM_ID:1][TYPE:1]，TYPE 语义见 gcm 库 protocol 包):
  * - 客户端 -> Worker: TYPE=0 CONNECT，DATA 为 ASCII "host:port|"
@@ -22,6 +24,9 @@
  *   每项支持 host 或 host:port；无硬编码默认值）
  *   注意：ENABLE_FALLBACK=false 会把第 2~4 级（?fallbackip=、动态节点、静态 FALLBACK_IPS）整体关闭，
  *   只剩直连；ENABLE_DYNAMIC_NODES 可单独关闭动态节点这一级。
+ *   ?proxy-all=true 则砍掉第 1 级（直连），从第 2 级起步——用于「强制所有流量走指定出口」。
+ *   出口条目里的显式端口是 **L4 覆盖**语义：目标端口被该端口替换，节点靠报文（SNI/Host/端口表）
+ *   自行路由到真实目标——**不是 SOCKS/HTTP 代理，Worker 不做任何握手**。
  *
  * 仓库: https://github.com/v2up-32mb/gcm-worker
  *   协议规范（消息类型/头长度）以 gcm 库仓 protocol/message.go 为准，改动前先看 AGENTS.md
@@ -52,6 +57,7 @@ const DEFAULT_CONFIG = {
   maxStreamsPerConnection: 16,
   maxPendingBytes: 1048576, // 预连接窗口内每条流最多缓存 1MiB 早期数据，超限即快速失败
   maxFallbackIPs: 16, // ?fallbackip= 条数上限，防止单条 CONNECT 拉出超长拨号链
+  proxyAll: false, // ?proxy-all= 默认关（query 参数，非环境变量）
   enableDynamicNodes: true,
   dynamicNodesUrl: "",
   dynamicNodesTimeout: 3000, // 拉取动态列表超时 3s，失败直接降级
@@ -413,9 +419,12 @@ class StreamManager {
       return false;
     }
     const { host, port } = target;
+    const proxyAll = this.config.proxyAll === true;
     // 出口顺序：直连 > 客户端传入 fallback > 动态节点 > 静态 fallback
-    // 1. 直连优先
-    {
+    // 1. 直连优先（?proxy-all=true 时整段跳过）
+    if (proxyAll) {
+      this.log(`[${streamId}] ?proxy-all=true：跳过直连，直接从回退链起步`);
+    } else {
       const r = await this.tryDial(stream, host, port, "直连");
       if (r === "connected") return true;
       if (r === "aborted") return false;
@@ -427,9 +436,11 @@ class StreamManager {
       this.log("客户端 ?fallbackip= 与动态/静态回退已被 ENABLE_FALLBACK=false 全部关闭");
     }
 
+    let attempted = 0;
     if (this.config.enableFallback) {
-      // 去重集合：前面已试过的，后面不再重复试（直连已试过，播种进去）
-      const seenHosts = new Set([`${host.toLowerCase()}:${port}`]);
+      // 去重集合：只在直连**真的试过**时播种——proxy-all 跳过直连后，
+      // 与目标同址的回退条目才是用户真正想用的出口，不能被当成"已试"跳过
+      const seenHosts = new Set(proxyAll ? [] : [`${host.toLowerCase()}:${port}`]);
 
       // 出口链 2~4 级，顺序即对外契约（AGENTS 约束 6）：
       //   客户端 ?fallbackip= > 动态节点 API > 静态 FALLBACK_IPS
@@ -452,12 +463,19 @@ class StreamManager {
           if (seenHosts.has(key)) continue;
           seenHosts.add(key);
           n++;
+          attempted++;
           const r = await this.tryDial(stream, parsed.host, parsed.port, `${label}[${n}/${list.length}]`);
           if (r === "connected") return true;
           if (r === "aborted") return false;
         }
         this.log(`[${streamId}] ${label}: 尝试 ${n}/${list.length} 个出口`);
       }
+    }
+
+    // proxy-all 却一条出口都没试到：补一句人话日志，否则客户端只看到裸 CLOSE 无法定位
+    // （ENABLE_FALLBACK=false，或 ?fallbackip=/动态节点/FALLBACK_IPS 全空）
+    if (proxyAll && attempted === 0) {
+      logError("Mux", "?proxy-all=true 但无任何可用回退出口（?fallbackip= / 动态节点 / FALLBACK_IPS 均为空，或 ENABLE_FALLBACK=false）");
     }
 
     // 所有尝试都失败：回 CLOSE 让客户端立即失败（否则客户端只能等自己的超时），再清理预注册的流
@@ -758,9 +776,13 @@ export default {
         const envFallbackIPs = splitList(env.FALLBACK_IPS);
         // 静态 fallback 只从环境变量读取，不再合并硬编码默认值
         const staticFallbackIPs = dedupList([...envFallbackIPs]);
+        // ?proxy-all= 连接级开关：true 时本连接所有流跳过直连，直接走回退链
+        // （沿用 parseEnvBool 的真值集合；缺省 false。客户端可控，与 ?fallbackip= 同信任级）
+        const proxyAll = parseEnvBool(url.searchParams.get("proxy-all"), DEFAULT_CONFIG.proxyAll);
 
         const config = {
           ...baseConfig,
+          proxyAll,
           cfQueryFallbackIPs: queryFallbackIPs,
           cfFallbackIPs: staticFallbackIPs,
         };

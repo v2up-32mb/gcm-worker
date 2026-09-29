@@ -13,7 +13,7 @@ Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用�
 | `worker.js`（可读版，约 33 KiB） | 常规部署：下面的方式一/方式二都用它 |
 | `worker.snippets.min.js`（压缩版，约 12 KiB / gzip 5 KiB） | Cloudflare **Snippets** 等对脚本体积有限制的场景 |
 
-两者行为完全一致（CI 用同一套 105 条用例同时跑两个产物）。压缩版随 release 一起发布，
+两者行为完全一致（CI 用同一套 119 条用例同时跑两个产物）。压缩版随 release 一起发布，
 也可本地 `npm run build` 重建——**它是构建产物，不要手改**。
 
 ## 方式一：Dashboard 粘贴（最快）
@@ -57,6 +57,19 @@ npx wrangler dev           # 本地调试：ws://localhost:8787/<USER_ID>
 
 出口优先级：直连原始 host > 客户端 `?fallbackip=` > 动态节点 API > 静态 `FALLBACK_IPS`
 （后三级仅在 `ENABLE_FALLBACK=true` 时生效，动态节点另受 `ENABLE_DYNAMIC_NODES` 控制）。
+
+## query 参数（非环境变量）
+
+| 参数 | 说明 |
+|---|---|
+| `fallbackip` | 客户端侧出口偏好。可重复/逗号分隔，每项 `host` 或 `host:port`（含 `[ipv6]` 方括号写法），条数受 `MAX_FALLBACK_IPS` 限制 |
+| `proxy-all` | 连接级开关。`1/true/yes/on`（大小写不敏感）= 跳过直连，所有流直接从 `?fallbackip=` 起步走回退链；缺省 `false` |
+
+`fallbackip` 里的显式端口是 **L4 覆盖**语义（目标端口被替换、目标地址丢弃，节点靠报文自路由），
+**不是 SOCKS5 / HTTP CONNECT 代理**——Worker 不做任何握手。
+
+`proxy-all=true` 但一条回退都拿不到时（三个来源全空或 `ENABLE_FALLBACK=false`）：零拨号直接回
+CLOSE，并记 `?proxy-all=true 但无任何可用回退出口`。
 
 ## 已知限制
 

@@ -254,6 +254,92 @@ for (const [label, worker] of VARIANTS) {
       }
     });
 
+    test("?proxy-all=true：跳过直连，直接从 ?fallbackip= 起步（对外契约）", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=q.example&proxy-all=true",
+        envVars: { FALLBACK_IPS: "static.example" },
+      });
+      await server.fromClient(connectFrame(11, "direct.example", 443));
+      await waitFor(() => server.typesOf(11).includes(T.CLOSE), { label: "全链失败 CLOSE" });
+      assert.deepEqual(
+        sockets().map((s) => s.opts.hostname),
+        ["q.example", "static.example"],
+        "直连不应被尝试，回退链顺序不变",
+      );
+    });
+
+    test("?proxy-all= 真值集合：1/yes/on 生效，缺省与假值不生效", async () => {
+      for (const v of ["1", "yes", "on", "TRUE"]) {
+        resetStub();
+        setPolicy(() => "reject");
+        const { server } = await openSession(worker, { query: `?fallbackip=q.example&proxy-all=${v}` });
+        await server.fromClient(connectFrame(1, "direct.example", 443));
+        await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: `proxy-all=${v} 全败 CLOSE` });
+        assert.deepEqual(
+          sockets().map((s) => s.opts.hostname),
+          ["q.example"],
+          `proxy-all=${v} 应跳过直连`,
+        );
+      }
+      for (const q of ["", "&proxy-all=false", "&proxy-all=0", "&proxy-all=nope"]) {
+        resetStub();
+        setPolicy(() => "reject");
+        const { server } = await openSession(worker, { query: `?fallbackip=q.example${q}` });
+        await server.fromClient(connectFrame(1, "direct.example", 443));
+        await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: `缺省(${q}) 全败 CLOSE` });
+        assert.deepEqual(
+          sockets().map((s) => s.opts.hostname),
+          ["direct.example", "q.example"],
+          `缺省/假值(${q}) 必须保持直连优先`,
+        );
+      }
+    });
+
+    test("?proxy-all=true 且回退条目与目标同址：仍应拨（回归：被去重集合误跳过）", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=same.example&proxy-all=true",
+      });
+      await server.fromClient(connectFrame(2, "same.example", 443));
+      await waitFor(() => server.typesOf(2).includes(T.CLOSE), { label: "全败 CLOSE" });
+      assert.deepEqual(
+        sockets().map((s) => s.opts.hostname),
+        ["same.example"],
+        "直连没试过就不该播种去重，同址回退必须被试",
+      );
+    });
+
+    test("?proxy-all=true 但零回退可用：一个 socket 都不拨，直接 CLOSE", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, { query: "?proxy-all=true" });
+      await server.fromClient(connectFrame(3, "direct.example", 443));
+      await waitFor(() => server.typesOf(3).includes(T.CLOSE), { label: "无出口 CLOSE" });
+      assert.equal(sockets().length, 0, "无回退可用时不得回退去拨直连");
+    });
+
+    test("?proxy-all=true + ENABLE_FALLBACK=false：零拨号直接 CLOSE", async () => {
+      setPolicy(() => "reject");
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=q.example&proxy-all=true",
+        envVars: { ENABLE_FALLBACK: "false" },
+      });
+      await server.fromClient(connectFrame(4, "direct.example", 443));
+      await waitFor(() => server.typesOf(4).includes(T.CLOSE), { label: "无出口 CLOSE" });
+      assert.equal(sockets().length, 0, "回退全关时不得有任何拨号");
+    });
+
+    test("?proxy-all=true 时成功走通回退：CONNECTED 正常下发", async () => {
+      setPolicy((opts) => (opts.hostname === "q.example" ? "open" : "reject"));
+      const { server } = await openSession(worker, {
+        query: "?fallbackip=q.example&proxy-all=true",
+      });
+      await server.fromClient(connectFrame(5, "direct.example", 443));
+      await waitFor(() => server.typesOf(5).includes(T.CONNECTED), { label: "回退成功 CONNECTED" });
+      assert.equal(server.typesOf(5)[0], T.CONNECTED);
+      assert.deepEqual(sockets().map((s) => s.opts.hostname), ["q.example"]);
+    });
+
     test("对不存在的 streamId 发 DATA/CLOSE：零回帧且不占槽位", async () => {
       const { server } = await openSession(worker, { envVars: { MAX_STREAMS_PER_CONNECTION: "1" } });
       const before = server.sent.length;

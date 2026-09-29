@@ -4,6 +4,36 @@
 
 ---
 
+## v0.1.2 — 2026-09-29
+
+**Added**
+
+- **`?proxy-all=true`（连接级开关，非破坏性）**：为真值（`1/true/yes/on`，大小写不敏感）时，
+  本次 WebSocket 连接上**所有**流**跳过「直连」一级**，直接从 `?fallbackip=` 起步走回退链，
+  用于「所有流量必须从指定出口出去」。缺省 `false`，客户端不传时行为与之前逐字节一致。
+  出口顺序在开关打开时收缩为 `?fallbackip= > 动态节点 > 静态 FALLBACK_IPS`。
+  - 真无回退可用时（三个来源全空或 `ENABLE_FALLBACK=false`）**零拨号**直接回 CLOSE，
+    并记 `logError`「?proxy-all=true 但无任何可用回退出口」——否则客户端只看到裸 CLOSE 无法定位。
+  - 去重集合改为**仅在直连真的试过时播种**（`seenHosts`）。跳过直连后，与目标同址的回退条目
+    （如目标 `same.example:443` + `?fallbackip=same.example`）正是用户想要的出口，
+    不能被当成「已试」跳过。
+  - 升级指引：服务端无需任何操作，部署即生效。客户端侧走 gcm 库仓的 `buildWSSURL`：
+    `xshared v0.1.2` 的 `Config.ProxyAll` + `gcm v0.1.2` 的 query 拼接 + gcm-cli 的 `--proxy-all`
+    （`gcm-cli v1.1.0`）。**不能**用 `--worker 'host?proxy-all=true'` 绕过——该值同时用作
+    URL 主机、TLS SNI 与 `Host` 头，带 query 会直接搞坏握手。旧版客户端不传该参数即旧行为。
+  - 旧版客户端/旧版 Worker 交叉组合均安全：Worker 只读认识的 query，多带参数被忽略；
+    客户端不传则直接照旧先直连。
+
+**Fixed**
+
+- **`package.json` 版本号与 CHANGELOG 脱节**：`package.json` 一直停在 `0.1.0`，而 CHANGELOG
+  已发到 v0.1.1。`scripts/build.mjs` 的 `version()` 直接读它并写进 snippets 产物的
+  banner——所以**上一版 v0.1.1 发布出去的压缩版，头部注释实际写的是 v0.1.0**。
+  本版起对齐为 `0.1.2`，与 CHANGELOG 一致。
+- 文档里的用例数从 105 更新为 119（`AGENTS.md` / `DEPLOY.md` / `README.md` 三处）。
+
+---
+
 ## v0.1.1 — 2026-09-26
 
 **Fixed（本轮多身份评审驱动）**
