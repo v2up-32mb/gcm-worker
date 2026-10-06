@@ -71,7 +71,7 @@ gcm(Go 核心库: 客户端侧 2 字节头多路复用/连接池/流管理/中�
 | `DEPLOY.md` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |
 | `scripts/build.mjs` | 压缩版构建（snippets）+ 体积预算 + 测试产物构建 |
 | `scripts/check-protocol.mjs` | 跨仓协议一致性检查（比对 gcm `protocol/message.go`），CI 强校验入口 |
-| `test/` | `cf-sockets-stub.mjs`（socket 替身）、`harness.mjs`（运行时替身与会话驱动）、`worker.test.mjs`（123 条用例） |
+| `test/` | `cf-sockets-stub.mjs`（socket 替身）、`harness.mjs`（运行时替身与会话驱动）、`worker.test.mjs`（125 条用例） |
 | `wrangler.toml.example` | Wrangler 配置模板（真实 `wrangler.toml` 不入库） |
 | `package.json` | `check` / `check:syntax` / `check:protocol` / `dev` / `deploy` 脚本 |
 

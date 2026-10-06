@@ -76,7 +76,7 @@ Dashboard 粘贴部署（最快，无需本地环境）见 [`DEPLOY.md`](DEPLOY.
 | `DEPLOY.md` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |
 | `scripts/build.mjs` | 构建 snippets 压缩版 + 体积预算；`buildTestable()` 产出测试可加载的模块 |
 | `scripts/check-protocol.mjs` | 与 gcm `protocol/message.go` 比对消息类型/头长度，防协议漂移 |
-| `test/` | Node 侧替身与 123 条用例（可读版与压缩版跑同一套） |
+| `test/` | Node 侧替身与 125 条用例（可读版与压缩版跑同一套） |
 | `wrangler.toml.example` | Wrangler 配置模板（真实 `wrangler.toml` 不入库） |
 
 ## 两种发布产物
@@ -93,7 +93,7 @@ Dashboard 粘贴部署（最快，无需本地环境）见 [`DEPLOY.md`](DEPLOY.
 ## 测试
 
 ```bash
-npm run check          # 语法 + 跨仓协议一致性 + 123 条用例（可读版 & 压缩版）
+npm run check          # 语法 + 跨仓协议一致性 + 125 条用例（可读版 & 压缩版）
 npm run check:syntax   # 仅语法
 npm run check:protocol # 仅协议一致性（未检出 gcm 库仓时降级为自检并提示）
 npm test               # 仅用例

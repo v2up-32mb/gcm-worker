@@ -13,7 +13,7 @@ Cloudflare Worker 实现 GCM 协议服务端（WebSocket 二进制多路复用�
 | `worker.js`（可读版，约 33 KiB） | 常规部署：下面的方式一/方式二都用它 |
 | `worker.snippets.min.js`（压缩版，约 12 KiB / gzip 5 KiB） | Cloudflare **Snippets** 等对脚本体积有限制的场景 |
 
-两者行为完全一致（CI 用同一套 123 条用例同时跑两个产物）。压缩版随 release 一起发布，
+两者行为完全一致（CI 用同一套 125 条用例同时跑两个产物）。压缩版随 release 一起发布，
 也可本地 `npm run build` 重建——**它是构建产物，不要手改**。
 
 ## 方式一：Dashboard 粘贴（最快）

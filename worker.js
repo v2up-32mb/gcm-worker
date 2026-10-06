@@ -375,17 +375,22 @@ async function getDynamicFallbacks(config) {
 // 让调用方登记在途 socket——流被客户端放弃时可以立刻取消，不必等满 CONNECT_TIMEOUT
 // 竞速失败（超时/连接被拒）一律 close：socket 在 connect() 时就已存在，
 // 迟到的成功连接否则会一直挂到 isolate 结束
+//
+// ⚠️ 只能用闭包里的 socket，绝不能用 socket.opened 的**兑现值**：
+// 线上 workerd 的 `socket.opened` 兑现的是内部对象（无 readable/writable/close），
+// `const s = await socket.opened; s.writable` 会抛
+// "Cannot read properties of undefined (reading 'getWriter')"——每条成功建连的流当场崩，
+// 客户端只看到 CLOSE（日志形如「直连失败: ...getWriter」，实测全部出口皆如此）。
+// 曾因测试替身把 opened 兑现成 socket 自身而长期未暴露。
 async function dialWithTimeout(host, port, timeoutMs, onSocket) {
   const socket = connect({ hostname: host, port });
   onSocket?.(socket);
   let won = false;
   let timer = null;
   try {
-    return await Promise.race([
-      socket.opened.then((v) => {
-        won = true;
-        return v;
-      }),
+    // 只等结算，不取兑现值（见上方说明）
+    await Promise.race([
+      socket.opened,
       new Promise((_, reject) => {
         timer = setTimeout(
           () => reject(new Error("Connection timeout")),
@@ -393,6 +398,8 @@ async function dialWithTimeout(host, port, timeoutMs, onSocket) {
         );
       }),
     ]);
+    won = true;
+    return socket;
   } finally {
     clearTimeout(timer);
     if (!won) {

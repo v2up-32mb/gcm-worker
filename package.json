@@ -1,6 +1,6 @@
 {
   "name": "gcm-worker",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "private": true,
   "description": "GCM 二进制多路复用协议的 Cloudflare Worker 服务端（对端 github.com/v2up-32mb/gcm）",
   "type": "module",

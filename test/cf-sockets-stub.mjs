@@ -52,8 +52,13 @@ export function connect(opts) {
   // 未处理的 opened 拒绝不应影响测试进程
   opened.catch(() => {});
 
-  // Cloudflare 语义：socket.opened 兑现为 socket 自身
-  rec.resolveOpened = () => openedResolve(socket);
+  // Cloudflare 语义：`socket.opened` 兑现的是**内部对象**（不是 socket 本身，
+  // 无 readable/writable/close）。真实 workerd 实测：`await socket.opened` 得到
+  // 一个 object 且 `v === socket` 为 false。任何写成
+  // `const s = await socket.opened; s.writable.getWriter()` 的代码线上必崩
+  // （"Cannot read properties of undefined (reading 'getWriter')"），
+  // 故此处刻意不给 socket，让该误用在用例里当场暴露而不是被替身掩盖。
+  rec.resolveOpened = () => openedResolve(Object.freeze({ __openedSentinel: true }));
   rec.rejectOpened = (err) => openedReject(err || new Error("connect refused"));
 
   const socket = {
@@ -103,5 +108,6 @@ export function connect(opts) {
     /* 保持 pending，等 worker 侧超时 */
   } else rec.rejectOpened(new Error(`connect refused: ${opts.hostname}:${opts.port}`));
 
+  rec.socket = socket; // 供用例核对「opened 兑现值 ≠ socket」这一真实 workerd 语义
   return socket;
 }

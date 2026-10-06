@@ -83,7 +83,7 @@ jobs:
             echo "| \`worker.snippets.min.js\` | **压缩版**（${RAW} B / gzip ${GZ} B），用于 Cloudflare Snippets 等对脚本体积有限制的场景 |"
             echo "| \`DEPLOY.md\` | 部署方式（Dashboard 粘贴 / Wrangler）与环境变量表 |"
             echo ""
-            echo "两个版本行为完全一致：CI 用同一套 105 条用例同时跑可读版与压缩版，任一行为差异都会让发版失败。"
+            echo "两个版本行为完全一致：CI 用同一套 125 条用例同时跑可读版与压缩版，任一行为差异都会让发版失败。"
             echo ""
             echo "部署配置（\`wrangler.toml\`、域名与账号）不随发布提供，复制 \`wrangler.toml.example\` 自行准备。"
             echo ""

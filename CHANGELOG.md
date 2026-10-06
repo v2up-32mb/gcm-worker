@@ -4,6 +4,40 @@
 
 ---
 
+## v0.1.4 — 2026-10-06
+
+**Fixed（P0：线上代理功能全断）**
+
+- **建流不再使用 `socket.opened` 的兑现值当 socket**：线上 workerd 的 `socket.opened`
+  兑现的是**内部对象**（无 `readable`/`writable`/`close`），此前 `dialWithTimeout` 把这个兑现值
+  当成 socket 返回，随即 `.writable.getWriter()` 抛
+  `TypeError: Cannot read properties of undefined (reading 'getWriter')`——
+  **凡是真拨号成功的出口一律当场失败**，客户端只看到 CLOSE，表现为
+  「连接池预热正常（只建 WebSocket，不建流）、每个代理请求立刻
+  `连接未建立即关闭`」。
+  - Worker 侧日志证据（每个出口都一样）：`[Mux] [5] 直连失败: Cannot read properties of
+    undefined (reading 'getWriter')`、`fallback[1/2]失败: ...getWriter`；
+    同一账号的裸 `connect()` 探针显示 `137.220.225.56:443` 103ms 就 `opened`——
+    即出站 TCP 本身没问题，崩在拿到 socket 之后。
+  - 现只 `await socket.opened`（等结算），返回值取 `connect()` 闭包里的 socket 本体。
+  - 对客户端**无影响**：Wire 协议、消息类型、握手编排均未变，升级 Worker 即恢复。
+  - 该缺陷自 `6fafb3a` 引入，此前一直未被发现，因为测试替身把 `opened` 兑现成了 socket 自身。
+  - **升级指引**：服务端替换 `worker.js` 即可，无需改客户端/配置。症状为「连接池预热正常
+    （只建 WebSocket）、每个代理请求立即 `连接未建立即关闭`」，修复后恢复。
+  - 排查建议（本次实测所得，非代码必改）：`CONNECT_TIMEOUT` 1000ms 对 socks5 握手偏紧，
+    建议 3000；`ENABLE_LOGGING=false` 会让此类故障现场无从查证，排查期间建议打开。
+
+**Fixed（测试基础设施）**
+
+- **`test/cf-sockets-stub.mjs` 对齐真实 workerd 语义**：`opened` 改兑现为哨兵对象
+  （≠ socket、无 `readable`/`writable`），并在 `rec.socket` 暴露 socket 本体供用例核对。
+  替身此前把这条语义写反（「Cloudflare 语义：socket.opened 兑现为 socket 自身」），
+  使整套 123 条用例对该类误用完全免疫；现配套新增回归用例
+  「socket.opened 兑现值不是 socket 本身」，并把断言 `rec.socket` 开放给用例。
+  对照验证：把 `worker.js` 改回旧写法后，整套用例大面积失败。
+
+---
+
 ## v0.1.3 — 2026-09-29
 
 **Changed（破坏性语义变更，v0.1.2 已发布过旧语义）**

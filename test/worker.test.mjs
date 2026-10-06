@@ -241,6 +241,23 @@ for (const [label, worker] of VARIANTS) {
       await waitFor(() => server.typesOf(1).includes(T.CLOSE), { label: "CLOSE" });
     });
 
+    test("socket.opened 兑现值不是 socket 本身：建流只能用 connect() 返回的那个（回归：线上预热正常、每个代理请求秒 CLOSE）", async () => {
+      // 真实 workerd：`await socket.opened` 兑现的是内部对象（无 readable/writable/close）。
+      // dialWithTimeout 曾把这个兑现值当 socket 返回，`.writable.getWriter()` 抛
+      // TypeError「Cannot read properties of undefined (reading 'getWriter')」，
+      // 于是**每条成功建连的流都当场失败**，客户端只看到 CLOSE
+      // （Worker 日志：每个出口都「失败: ...getWriter」）。
+      // 替身按真实语义兑现，本用例钉住这条契约 + 正常建流确实拿到 CONNECTED。
+      const { server } = await openSession(worker);
+      await server.fromClient(connectFrame(31, "opened.example", 443));
+      await waitFor(() => sockets().length >= 1, { label: "拨出" });
+      const sock = sockets()[0];
+      const openedValue = await sock.socket.opened;
+      assert.notEqual(openedValue, sock.socket, "opened 兑现值必须 ≠ socket（与真实 workerd 一致）");
+      assert.equal(openedValue.writable, undefined, "opened 兑现值不得带 writable");
+      await waitFor(() => server.typesOf(31).includes(T.CONNECTED), { label: "CONNECTED" });
+    });
+
     test("TCP 未连上时的早期 DATA 被缓存并在连上后 flush", async () => {
       setPolicy(() => "hang");
       const { server } = await openSession(worker, { envVars: { CONNECT_TIMEOUT: "100000" } });
